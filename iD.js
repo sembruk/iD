@@ -20811,6 +20811,46 @@ iD.actions.Circularize = function(wayId, projection, maxAngle) {
 
     return action;
 };
+// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/DeleteRelationAction.as
+iD.actions.DeleteRelation = function(relationId) {
+    function deleteEntity(entity, graph) {
+        return !graph.parentWays(entity).length &&
+            !graph.parentRelations(entity).length &&
+            !entity.hasInterestingTags();
+    }
+
+    var action = function(graph) {
+        var relation = graph.entity(relationId);
+
+        graph.parentRelations(relation)
+            .forEach(function(parent) {
+                parent = parent.removeMembersWithID(relationId);
+                graph = graph.replace(parent);
+
+                if (parent.isDegenerate()) {
+                    graph = iD.actions.DeleteRelation(parent.id)(graph);
+                }
+            });
+
+        _.uniq(_.pluck(relation.members, 'id')).forEach(function(memberId) {
+            graph = graph.replace(relation.removeMembersWithID(memberId));
+
+            var entity = graph.entity(memberId);
+            if (deleteEntity(entity, graph)) {
+                graph = iD.actions.DeleteMultiple([memberId])(graph);
+            }
+        });
+
+        return graph.remove(relation);
+    };
+
+    action.disabled = function(graph) {
+        if (!graph.entity(relationId).isComplete(graph))
+            return 'incomplete_relation';
+    };
+
+    return action;
+};
 // Create a restriction relation for `turn`, which must have the following structure:
 //
 //     {
@@ -20899,6 +20939,29 @@ iD.actions.RestrictTurn = function(turn, projection, restrictionId) {
         }));
     };
 };
+iD.actions.AddMidpoint = function(midpoint, node) {
+    return function(graph) {
+        graph = graph.replace(node.move(midpoint.loc));
+
+        var parents = _.intersection(
+            graph.parentWays(graph.entity(midpoint.edge[0])),
+            graph.parentWays(graph.entity(midpoint.edge[1])));
+
+        parents.forEach(function(way) {
+            for (var i = 0; i < way.nodes.length - 1; i++) {
+                if (iD.geo.edgeEqual([way.nodes[i], way.nodes[i + 1]], midpoint.edge)) {
+                    graph = graph.replace(graph.entity(way.id).addNode(node.id, i + 1));
+
+                    // Add only one midpoint on doubled-back segments,
+                    // turning them into self-intersections.
+                    return;
+                }
+            }
+        });
+
+        return graph;
+    };
+};
 iD.actions.DeprecateTags = function(entityId) {
     return function(graph) {
         var entity = graph.entity(entityId),
@@ -20939,6 +21002,112 @@ iD.actions.AddEntity = function(way) {
     return function(graph) {
         return graph.replace(way);
     };
+};
+iD.actions.DeleteMultiple = function(ids) {
+    var actions = {
+        way: iD.actions.DeleteWay,
+        node: iD.actions.DeleteNode,
+        relation: iD.actions.DeleteRelation
+    };
+
+    var action = function(graph) {
+        ids.forEach(function(id) {
+            if (graph.hasEntity(id)) { // It may have been deleted aready.
+                graph = actions[graph.entity(id).type](id)(graph);
+            }
+        });
+
+        return graph;
+    };
+
+    action.disabled = function(graph) {
+        for (var i = 0; i < ids.length; i++) {
+            var id = ids[i],
+                disabled = actions[graph.entity(id).type](id).disabled(graph);
+            if (disabled) return disabled;
+        }
+    };
+
+    return action;
+};
+// Connect the ways at the given nodes.
+//
+// The last node will survive. All other nodes will be replaced with
+// the surviving node in parent ways, and then removed.
+//
+// Tags and relation memberships of of non-surviving nodes are merged
+// to the survivor.
+//
+// This is the inverse of `iD.actions.Disconnect`.
+//
+// Reference:
+//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MergeNodesAction.as
+//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/MergeNodesAction.java
+//
+iD.actions.Connect = function(nodeIds) {
+    return function(graph) {
+        var survivor = graph.entity(_.last(nodeIds));
+
+        for (var i = 0; i < nodeIds.length - 1; i++) {
+            var node = graph.entity(nodeIds[i]);
+
+            /* eslint-disable no-loop-func */
+            graph.parentWays(node).forEach(function(parent) {
+                if (!parent.areAdjacent(node.id, survivor.id)) {
+                    graph = graph.replace(parent.replaceNode(node.id, survivor.id));
+                }
+            });
+
+            graph.parentRelations(node).forEach(function(parent) {
+                graph = graph.replace(parent.replaceMember(node, survivor));
+            });
+            /* eslint-enable no-loop-func */
+
+            survivor = survivor.mergeTags(node.tags);
+            graph = iD.actions.DeleteNode(node.id)(graph);
+        }
+
+        graph = graph.replace(survivor);
+
+        return graph;
+    };
+};
+iD.actions.Merge = function(ids) {
+    function groupEntitiesByGeometry(graph) {
+        var entities = ids.map(function(id) { return graph.entity(id); });
+        return _.extend({point: [], area: [], line: [], relation: []},
+            _.groupBy(entities, function(entity) { return entity.geometry(graph); }));
+    }
+
+    var action = function(graph) {
+        var geometries = groupEntitiesByGeometry(graph),
+            target = geometries.area[0] || geometries.line[0],
+            points = geometries.point;
+
+        points.forEach(function(point) {
+            target = target.mergeTags(point.tags);
+
+            graph.parentRelations(point).forEach(function(parent) {
+                graph = graph.replace(parent.replaceMember(point, target));
+            });
+
+            graph = graph.remove(point);
+        });
+
+        graph = graph.replace(target);
+
+        return graph;
+    };
+
+    action.disabled = function(graph) {
+        var geometries = groupEntitiesByGeometry(graph);
+        if (geometries.point.length === 0 ||
+            (geometries.area.length + geometries.line.length) !== 1 ||
+            geometries.relation.length !== 0)
+            return 'not_eligible';
+    };
+
+    return action;
 };
 iD.actions.MergeRemoteChanges = function(id, localGraph, remoteGraph, formatUser) {
     var option = 'safe',  // 'safe', 'force_local', 'force_remote'
@@ -21191,251 +21360,6 @@ iD.actions.MergeRemoteChanges = function(id, localGraph, remoteGraph, formatUser
 
     action.conflicts = function() {
         return conflicts;
-    };
-
-    return action;
-};
-iD.actions.AddMidpoint = function(midpoint, node) {
-    return function(graph) {
-        graph = graph.replace(node.move(midpoint.loc));
-
-        var parents = _.intersection(
-            graph.parentWays(graph.entity(midpoint.edge[0])),
-            graph.parentWays(graph.entity(midpoint.edge[1])));
-
-        parents.forEach(function(way) {
-            for (var i = 0; i < way.nodes.length - 1; i++) {
-                if (iD.geo.edgeEqual([way.nodes[i], way.nodes[i + 1]], midpoint.edge)) {
-                    graph = graph.replace(graph.entity(way.id).addNode(node.id, i + 1));
-
-                    // Add only one midpoint on doubled-back segments,
-                    // turning them into self-intersections.
-                    return;
-                }
-            }
-        });
-
-        return graph;
-    };
-};
-iD.actions.DeleteMultiple = function(ids) {
-    var actions = {
-        way: iD.actions.DeleteWay,
-        node: iD.actions.DeleteNode,
-        relation: iD.actions.DeleteRelation
-    };
-
-    var action = function(graph) {
-        ids.forEach(function(id) {
-            if (graph.hasEntity(id)) { // It may have been deleted aready.
-                graph = actions[graph.entity(id).type](id)(graph);
-            }
-        });
-
-        return graph;
-    };
-
-    action.disabled = function(graph) {
-        for (var i = 0; i < ids.length; i++) {
-            var id = ids[i],
-                disabled = actions[graph.entity(id).type](id).disabled(graph);
-            if (disabled) return disabled;
-        }
-    };
-
-    return action;
-};
-// Connect the ways at the given nodes.
-//
-// The last node will survive. All other nodes will be replaced with
-// the surviving node in parent ways, and then removed.
-//
-// Tags and relation memberships of of non-surviving nodes are merged
-// to the survivor.
-//
-// This is the inverse of `iD.actions.Disconnect`.
-//
-// Reference:
-//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MergeNodesAction.as
-//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/MergeNodesAction.java
-//
-iD.actions.Connect = function(nodeIds) {
-    return function(graph) {
-        var survivor = graph.entity(_.last(nodeIds));
-
-        for (var i = 0; i < nodeIds.length - 1; i++) {
-            var node = graph.entity(nodeIds[i]);
-
-            /* eslint-disable no-loop-func */
-            graph.parentWays(node).forEach(function(parent) {
-                if (!parent.areAdjacent(node.id, survivor.id)) {
-                    graph = graph.replace(parent.replaceNode(node.id, survivor.id));
-                }
-            });
-
-            graph.parentRelations(node).forEach(function(parent) {
-                graph = graph.replace(parent.replaceMember(node, survivor));
-            });
-            /* eslint-enable no-loop-func */
-
-            survivor = survivor.mergeTags(node.tags);
-            graph = iD.actions.DeleteNode(node.id)(graph);
-        }
-
-        graph = graph.replace(survivor);
-
-        return graph;
-    };
-};
-iD.actions.Merge = function(ids) {
-    function groupEntitiesByGeometry(graph) {
-        var entities = ids.map(function(id) { return graph.entity(id); });
-        return _.extend({point: [], area: [], line: [], relation: []},
-            _.groupBy(entities, function(entity) { return entity.geometry(graph); }));
-    }
-
-    var action = function(graph) {
-        var geometries = groupEntitiesByGeometry(graph),
-            target = geometries.area[0] || geometries.line[0],
-            points = geometries.point;
-
-        points.forEach(function(point) {
-            target = target.mergeTags(point.tags);
-
-            graph.parentRelations(point).forEach(function(parent) {
-                graph = graph.replace(parent.replaceMember(point, target));
-            });
-
-            graph = graph.remove(point);
-        });
-
-        graph = graph.replace(target);
-
-        return graph;
-    };
-
-    action.disabled = function(graph) {
-        var geometries = groupEntitiesByGeometry(graph);
-        if (geometries.point.length === 0 ||
-            (geometries.area.length + geometries.line.length) !== 1 ||
-            geometries.relation.length !== 0)
-            return 'not_eligible';
-    };
-
-    return action;
-};
-/* warning!!
- *
- * this is still early code and tests need to be added */
-iD.actions.Slide = function(options, projection) {
-    function nodeInteresting(graph, node) {
-        return graph.parentWays(node).length > 1 ||
-            graph.parentRelations(node).length ||
-            node.hasInterestingTags();
-    }
-
-    function positionAlongWay(n, s, e) {
-        return ((n[0] - s[0]) * (e[0] - s[0]) + (n[1] - s[1]) * (e[1] - s[1]))/
-                (Math.pow(e[0] - s[0], 2) + Math.pow(e[1] - s[1], 2));
-    }
-
-    var action = function(graph) {
-        var way = options.way,
-            allNodes = options.allNodes,
-            relevantNodes = options.relevantNodes,
-            relevantStartIndex = options.relevantStartIndex,
-            relevantEndIndex = options.relevantEndIndex,
-            points = options.points,
-            closesPointIndex = [],
-            newNodes, newNodeIds, i, j;
-
-        // relevantNodes are the subset of the way is being slided.
-        // creates closesPointIndex, an injective mapping, 
-        // which foreach relevant node finds the closest new node.
-        // skips 'keyNodes' which are members of othe ways
-        var previousClosest = 0;
-        closesPointIndex.push(0);
-        for (i = 1; i < relevantNodes.length - 1; i++) {
-            var node = relevantNodes[i],
-                start = previousClosest + 1;
-
-            // member of other ways so, want keep it around the move it smartly
-            if (nodeInteresting(graph, node)) {
-                closesPointIndex.push(null);
-                continue;
-            }
-
-            var minDistIndex = null, minDist = Number.MAX_VALUE;
-            for (j = start; j < points.length - 1; j++) {
-                var dist = iD.geo.sphericalDistance(node.loc, points[j]);
-                if (dist < minDist) {
-                    minDist = dist;
-                    minDistIndex = j;
-                }
-            }
-
-            // couldn't find a closest because we have less new points than old, so delete it. 
-            // we know it's uninteresting because of check above
-            if (minDistIndex === null) {
-                graph = iD.actions.DeleteNode(node.id)(graph);
-            } else {
-                previousClosest = minDistIndex;
-            }
-
-            closesPointIndex.push(minDistIndex);
-        }
-        closesPointIndex.push(points.length-1);  // first and last don't move, thus stay the same node
-
-        // move the existing nodes and create the new ones.
-        previousClosest = 0;
-        newNodes = [relevantNodes[0]]; // first node doesn't move
-        for (i = 1; i < relevantNodes.length; i++) {
-            if (closesPointIndex[i] === null) {
-                // interesting so we do a special placement in the next loop
-                continue;
-            }
-
-            for (j = previousClosest + 1; j < closesPointIndex[i]; j++) {
-                var newNode = iD.Node({loc: points[j]});
-                newNodes.push(newNode);
-
-                graph = graph.replace(newNode);
-            }
-            previousClosest = closesPointIndex[i];
-
-            relevantNodes[i] = relevantNodes[i].move(points[closesPointIndex[i]]);
-            graph = graph.replace(relevantNodes[i]);
-
-            newNodes.push(relevantNodes[i]);
-        }
-
-        // place the key points on the best point of the new line
-        for (i = 1; i < relevantNodes.length - 1; i++) {
-            var n = relevantNodes[i];
-
-            if (closesPointIndex[i] === null && nodeInteresting(graph, n)) {
-                var result = iD.geo.chooseEdge(newNodes, projection(n.loc), projection);
-
-                n = n.move(result.loc);
-                graph = graph.replace(n);
-                if (iD.geo.sphericalDistance(newNodes[result.index - 1].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index - 1])) {
-                    graph = iD.actions.DeleteNode(newNodes[result.index - 1].id)(graph);
-                    newNodes[result.index - 1] = n;
-                } else if (iD.geo.sphericalDistance(newNodes[result.index].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index])) {
-                    graph = iD.actions.DeleteNode(newNodes[result.index].id)(graph);
-                    newNodes[result.index ] = n;
-                } else {
-                    newNodes.splice(result.index, 0, n);
-                }
-            }
-        }
-
-        // replace middle of th way  with new nodes
-        allNodes.splice.apply(allNodes, [relevantStartIndex, relevantEndIndex - relevantStartIndex + 1].concat(newNodes));
-
-        // set the complete list of node ids of the way
-        newNodeIds = allNodes.map(function(n) { return n.id; });
-        return graph.replace(way.update({nodes: newNodeIds}));
     };
 
     return action;
@@ -21912,6 +21836,473 @@ iD.actions.Move = function(moveIds, tryDelta, projection, cache) {
 
     return action;
 };
+// Disconect the ways at the given node.
+//
+// Optionally, disconnect only the given ways.
+//
+// For testing convenience, accepts an ID to assign to the (first) new node.
+// Normally, this will be undefined and the way will automatically
+// be assigned a new ID.
+//
+// This is the inverse of `iD.actions.Connect`.
+//
+// Reference:
+//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/UnjoinNodeAction.as
+//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/UnGlueAction.java
+//
+iD.actions.Disconnect = function(nodeId, newNodeId) {
+    var wayIds;
+
+    var action = function(graph) {
+        var node = graph.entity(nodeId),
+            connections = action.connections(graph);
+
+        connections.forEach(function(connection) {
+            var way = graph.entity(connection.wayID),
+                newNode = iD.Node({id: newNodeId, loc: node.loc, tags: node.tags});
+
+            graph = graph.replace(newNode);
+            if (connection.index === 0 && way.isArea()) {
+                // replace shared node with shared node..
+                graph = graph.replace(way.replaceNode(way.nodes[0], newNode.id));
+            } else {
+                // replace shared node with multiple new nodes..
+                graph = graph.replace(way.updateNode(newNode.id, connection.index));
+            }
+        });
+
+        return graph;
+    };
+
+    action.connections = function(graph) {
+        var candidates = [],
+            keeping = false,
+            parentWays = graph.parentWays(graph.entity(nodeId));
+
+        parentWays.forEach(function(way) {
+            if (wayIds && wayIds.indexOf(way.id) === -1) {
+                keeping = true;
+                return;
+            }
+            if (way.isArea() && (way.nodes[0] === nodeId)) {
+                candidates.push({wayID: way.id, index: 0});
+            } else {
+                way.nodes.forEach(function(waynode, index) {
+                    if (waynode === nodeId) {
+                        candidates.push({wayID: way.id, index: index});
+                    }
+                });
+            }
+        });
+
+        return keeping ? candidates : candidates.slice(1);
+    };
+
+    action.disabled = function(graph) {
+        var connections = action.connections(graph);
+        if (connections.length === 0 || (wayIds && wayIds.length !== connections.length))
+            return 'not_connected';
+
+        var parentWays = graph.parentWays(graph.entity(nodeId)),
+            seenRelationIds = {},
+            sharedRelation;
+
+        parentWays.forEach(function(way) {
+            if (wayIds && wayIds.indexOf(way.id) === -1)
+                return;
+
+            var relations = graph.parentRelations(way);
+            relations.forEach(function(relation) {
+                if (relation.id in seenRelationIds) {
+                    sharedRelation = relation;
+                } else {
+                    seenRelationIds[relation.id] = true;
+                }
+            });
+        });
+
+        if (sharedRelation)
+            return 'relation';
+    };
+
+    action.limitWays = function(_) {
+        if (!arguments.length) return wayIds;
+        wayIds = _;
+        return action;
+    };
+
+    return action;
+};
+iD.actions.Revert = function(id) {
+
+    var action = function(graph) {
+        var entity = graph.hasEntity(id),
+            base = graph.base().entities[id];
+
+        if (entity && !base) {    // entity will be removed..
+            if (entity.type === 'node') {
+                graph.parentWays(entity)
+                    .forEach(function(parent) {
+                        parent = parent.removeNode(id);
+                        graph = graph.replace(parent);
+
+                        if (parent.isDegenerate()) {
+                            graph = iD.actions.DeleteWay(parent.id)(graph);
+                        }
+                    });
+            }
+
+            graph.parentRelations(entity)
+                .forEach(function(parent) {
+                    parent = parent.removeMembersWithID(id);
+                    graph = graph.replace(parent);
+
+                    if (parent.isDegenerate()) {
+                        graph = iD.actions.DeleteRelation(parent.id)(graph);
+                    }
+                });
+        }
+
+        return graph.revert(id);
+    };
+
+    return action;
+};
+iD.actions.MergePolygon = function(ids, newRelationId) {
+
+    function groupEntities(graph) {
+        var entities = ids.map(function (id) { return graph.entity(id); });
+        return _.extend({
+                closedWay: [],
+                multipolygon: [],
+                other: []
+            }, _.groupBy(entities, function(entity) {
+                if (entity.type === 'way' && entity.isClosed()) {
+                    return 'closedWay';
+                } else if (entity.type === 'relation' && entity.isMultipolygon()) {
+                    return 'multipolygon';
+                } else {
+                    return 'other';
+                }
+            }));
+    }
+
+    var action = function(graph) {
+        var entities = groupEntities(graph);
+
+        // An array representing all the polygons that are part of the multipolygon.
+        //
+        // Each element is itself an array of objects with an id property, and has a
+        // locs property which is an array of the locations forming the polygon.
+        var polygons = entities.multipolygon.reduce(function(polygons, m) {
+            return polygons.concat(iD.geo.joinWays(m.members, graph));
+        }, []).concat(entities.closedWay.map(function(d) {
+            var member = [{id: d.id}];
+            member.nodes = graph.childNodes(d);
+            return member;
+        }));
+
+        // contained is an array of arrays of boolean values,
+        // where contained[j][k] is true iff the jth way is
+        // contained by the kth way.
+        var contained = polygons.map(function(w, i) {
+            return polygons.map(function(d, n) {
+                if (i === n) return null;
+                return iD.geo.polygonContainsPolygon(
+                    _.pluck(d.nodes, 'loc'),
+                    _.pluck(w.nodes, 'loc'));
+            });
+        });
+
+        // Sort all polygons as either outer or inner ways
+        var members = [],
+            outer = true;
+
+        while (polygons.length) {
+            extractUncontained(polygons);
+            polygons = polygons.filter(isContained);
+            contained = contained.filter(isContained).map(filterContained);
+        }
+
+        function isContained(d, i) {
+            return _.any(contained[i]);
+        }
+
+        function filterContained(d) {
+            return d.filter(isContained);
+        }
+
+        function extractUncontained(polygons) {
+            polygons.forEach(function(d, i) {
+                if (!isContained(d, i)) {
+                    d.forEach(function(member) {
+                        members.push({
+                            type: 'way',
+                            id: member.id,
+                            role: outer ? 'outer' : 'inner'
+                        });
+                    });
+                }
+            });
+            outer = !outer;
+        }
+
+        // Move all tags to one relation
+        var relation = entities.multipolygon[0] ||
+            iD.Relation({ id: newRelationId, tags: { type: 'multipolygon' }});
+
+        entities.multipolygon.slice(1).forEach(function(m) {
+            relation = relation.mergeTags(m.tags);
+            graph = graph.remove(m);
+        });
+
+        entities.closedWay.forEach(function(way) {
+            function isThisOuter(m) {
+                return m.id === way.id && m.role !== 'inner';
+            }
+            if (members.some(isThisOuter)) {
+                relation = relation.mergeTags(way.tags);
+                graph = graph.replace(way.update({ tags: {} }));
+            }
+        });
+
+        return graph.replace(relation.update({
+            members: members,
+            tags: _.omit(relation.tags, 'area')
+        }));
+    };
+
+    action.disabled = function(graph) {
+        var entities = groupEntities(graph);
+        if (entities.other.length > 0 ||
+            entities.closedWay.length + entities.multipolygon.length < 2)
+            return 'not_eligible';
+        if (!entities.multipolygon.every(function(r) { return r.isComplete(graph); }))
+            return 'incomplete_relation';
+    };
+
+    return action;
+};
+// https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/command/MoveCommand.java
+// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MoveNodeAction.as
+iD.actions.MoveNode = function(nodeId, loc) {
+    return function(graph) {
+        return graph.replace(graph.entity(nodeId).move(loc));
+    };
+};
+iD.actions.Noop = function() {
+    return function(graph) {
+        return graph;
+    };
+};
+iD.actions.ChangePreset = function(entityId, oldPreset, newPreset) {
+    return function(graph) {
+        var entity = graph.entity(entityId),
+            geometry = entity.geometry(graph),
+            tags = entity.tags;
+
+        if (oldPreset) tags = oldPreset.removeTags(tags, geometry);
+        if (newPreset) tags = newPreset.applyTags(tags, geometry);
+
+        return graph.replace(entity.update({tags: tags}));
+    };
+};
+/*
+ * Based on https://github.com/openstreetmap/potlatch2/net/systemeD/potlatch2/tools/Straighten.as
+ */
+
+iD.actions.Straighten = function(wayId, projection) {
+    function positionAlongWay(n, s, e) {
+        return ((n[0] - s[0]) * (e[0] - s[0]) + (n[1] - s[1]) * (e[1] - s[1]))/
+                (Math.pow(e[0] - s[0], 2) + Math.pow(e[1] - s[1], 2));
+    }
+
+    var action = function(graph) {
+        var way = graph.entity(wayId),
+            nodes = graph.childNodes(way),
+            points = nodes.map(function(n) { return projection(n.loc); }),
+            startPoint = points[0],
+            endPoint = points[points.length-1],
+            toDelete = [],
+            i;
+
+        for (i = 1; i < points.length-1; i++) {
+            var node = nodes[i],
+                point = points[i];
+
+            if (graph.parentWays(node).length > 1 ||
+                graph.parentRelations(node).length ||
+                node.hasInterestingTags()) {
+
+                var u = positionAlongWay(point, startPoint, endPoint),
+                    p0 = startPoint[0] + u * (endPoint[0] - startPoint[0]),
+                    p1 = startPoint[1] + u * (endPoint[1] - startPoint[1]);
+
+                graph = graph.replace(graph.entity(node.id)
+                    .move(projection.invert([p0, p1])));
+            } else {
+                // safe to delete
+                if (toDelete.indexOf(node) === -1) {
+                    toDelete.push(node);
+                }
+            }
+        }
+
+        for (i = 0; i < toDelete.length; i++) {
+            graph = iD.actions.DeleteNode(toDelete[i].id)(graph);
+        }
+
+        return graph;
+    };
+    
+    action.disabled = function(graph) {
+        // check way isn't too bendy
+        var way = graph.entity(wayId),
+            nodes = graph.childNodes(way),
+            points = nodes.map(function(n) { return projection(n.loc); }),
+            startPoint = points[0],
+            endPoint = points[points.length-1],
+            threshold = 0.2 * Math.sqrt(Math.pow(startPoint[0] - endPoint[0], 2) + Math.pow(startPoint[1] - endPoint[1], 2)),
+            i;
+
+        for (i = 1; i < points.length-1; i++) {
+            var point = points[i],
+                u = positionAlongWay(point, startPoint, endPoint),
+                p0 = startPoint[0] + u * (endPoint[0] - startPoint[0]),
+                p1 = startPoint[1] + u * (endPoint[1] - startPoint[1]),
+                dist = Math.sqrt(Math.pow(p0 - point[0], 2) + Math.pow(p1 - point[1], 2));
+
+            // to bendy if point is off by 20% of total start/end distance in projected space
+            if (dist > threshold) {
+                return 'too_bendy';
+            }
+        }
+    };
+
+    return action;
+};
+/* warning!!
+ *
+ * this is still early code and tests need to be added */
+iD.actions.Slide = function(options, projection) {
+    function nodeInteresting(graph, node) {
+        return graph.parentWays(node).length > 1 ||
+            graph.parentRelations(node).length ||
+            node.hasInterestingTags();
+    }
+
+    function positionAlongWay(n, s, e) {
+        return ((n[0] - s[0]) * (e[0] - s[0]) + (n[1] - s[1]) * (e[1] - s[1]))/
+                (Math.pow(e[0] - s[0], 2) + Math.pow(e[1] - s[1], 2));
+    }
+
+    var action = function(graph) {
+        var way = options.way,
+            allNodes = options.allNodes,
+            relevantNodes = options.relevantNodes,
+            relevantStartIndex = options.relevantStartIndex,
+            relevantEndIndex = options.relevantEndIndex,
+            points = options.points,
+            closesPointIndex = [],
+            newNodes, newNodeIds, i, j;
+
+        // relevantNodes are the subset of the way is being slided.
+        // creates closesPointIndex, an injective mapping, 
+        // which foreach relevant node finds the closest new node.
+        // skips 'keyNodes' which are members of othe ways
+        var previousClosest = 0;
+        closesPointIndex.push(0);
+        for (i = 1; i < relevantNodes.length - 1; i++) {
+            var node = relevantNodes[i],
+                start = previousClosest + 1;
+
+            // member of other ways so, want keep it around the move it smartly
+            if (nodeInteresting(graph, node)) {
+                closesPointIndex.push(null);
+                continue;
+            }
+
+            var minDistIndex = null, minDist = Number.MAX_VALUE;
+            for (j = start; j < points.length - 1; j++) {
+                var dist = iD.geo.sphericalDistance(node.loc, points[j]);
+                if (dist < minDist) {
+                    minDist = dist;
+                    minDistIndex = j;
+                }
+            }
+
+            // couldn't find a closest because we have less new points than old, so delete it. 
+            // we know it's uninteresting because of check above
+            if (minDistIndex === null) {
+                graph = iD.actions.DeleteNode(node.id)(graph);
+            } else {
+                previousClosest = minDistIndex;
+            }
+
+            closesPointIndex.push(minDistIndex);
+        }
+        closesPointIndex.push(points.length-1);  // first and last don't move, thus stay the same node
+
+        // move the existing nodes and create the new ones.
+        previousClosest = 0;
+        newNodes = [relevantNodes[0]]; // first node doesn't move
+        for (i = 1; i < relevantNodes.length; i++) {
+            if (closesPointIndex[i] === null) {
+                // interesting so we do a special placement in the next loop
+                continue;
+            }
+
+            for (j = previousClosest + 1; j < closesPointIndex[i]; j++) {
+                var newNode = iD.Node({loc: points[j]});
+                newNodes.push(newNode);
+
+                graph = graph.replace(newNode);
+            }
+            previousClosest = closesPointIndex[i];
+
+            relevantNodes[i] = relevantNodes[i].move(points[closesPointIndex[i]]);
+            graph = graph.replace(relevantNodes[i]);
+
+            newNodes.push(relevantNodes[i]);
+        }
+
+        // place the key points on the best point of the new line
+        for (i = 1; i < relevantNodes.length - 1; i++) {
+            var n = relevantNodes[i];
+
+            if (closesPointIndex[i] === null && nodeInteresting(graph, n)) {
+                var result = iD.geo.chooseEdge(newNodes, projection(n.loc), projection);
+
+                n = n.move(result.loc);
+                graph = graph.replace(n);
+                if (iD.geo.sphericalDistance(newNodes[result.index - 1].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index - 1])) {
+                    graph = iD.actions.DeleteNode(newNodes[result.index - 1].id)(graph);
+                    newNodes[result.index - 1] = n;
+                } else if (iD.geo.sphericalDistance(newNodes[result.index].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index])) {
+                    graph = iD.actions.DeleteNode(newNodes[result.index].id)(graph);
+                    newNodes[result.index ] = n;
+                } else {
+                    newNodes.splice(result.index, 0, n);
+                }
+            }
+        }
+
+        // replace middle of th way  with new nodes
+        allNodes.splice.apply(allNodes, [relevantStartIndex, relevantEndIndex - relevantStartIndex + 1].concat(newNodes));
+
+        // set the complete list of node ids of the way
+        newNodeIds = allNodes.map(function(n) { return n.id; });
+        return graph.replace(way.update({nodes: newNodeIds}));
+    };
+
+    return action;
+};
+iD.actions.ChangeTags = function(entityId, tags) {
+    return function(graph) {
+        var entity = graph.entity(entityId);
+        return graph.replace(entity.update({tags: tags}));
+    };
+};
 /*
  * Based on https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/potlatch2/tools/Quadrilateralise.as
  */
@@ -22084,426 +22475,6 @@ iD.actions.Orthogonalize = function(wayId, projection) {
 
     return action;
 };
-// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/DeleteRelationAction.as
-iD.actions.DeleteRelation = function(relationId) {
-    function deleteEntity(entity, graph) {
-        return !graph.parentWays(entity).length &&
-            !graph.parentRelations(entity).length &&
-            !entity.hasInterestingTags();
-    }
-
-    var action = function(graph) {
-        var relation = graph.entity(relationId);
-
-        graph.parentRelations(relation)
-            .forEach(function(parent) {
-                parent = parent.removeMembersWithID(relationId);
-                graph = graph.replace(parent);
-
-                if (parent.isDegenerate()) {
-                    graph = iD.actions.DeleteRelation(parent.id)(graph);
-                }
-            });
-
-        _.uniq(_.pluck(relation.members, 'id')).forEach(function(memberId) {
-            graph = graph.replace(relation.removeMembersWithID(memberId));
-
-            var entity = graph.entity(memberId);
-            if (deleteEntity(entity, graph)) {
-                graph = iD.actions.DeleteMultiple([memberId])(graph);
-            }
-        });
-
-        return graph.remove(relation);
-    };
-
-    action.disabled = function(graph) {
-        if (!graph.entity(relationId).isComplete(graph))
-            return 'incomplete_relation';
-    };
-
-    return action;
-};
-iD.actions.MergePolygon = function(ids, newRelationId) {
-
-    function groupEntities(graph) {
-        var entities = ids.map(function (id) { return graph.entity(id); });
-        return _.extend({
-                closedWay: [],
-                multipolygon: [],
-                other: []
-            }, _.groupBy(entities, function(entity) {
-                if (entity.type === 'way' && entity.isClosed()) {
-                    return 'closedWay';
-                } else if (entity.type === 'relation' && entity.isMultipolygon()) {
-                    return 'multipolygon';
-                } else {
-                    return 'other';
-                }
-            }));
-    }
-
-    var action = function(graph) {
-        var entities = groupEntities(graph);
-
-        // An array representing all the polygons that are part of the multipolygon.
-        //
-        // Each element is itself an array of objects with an id property, and has a
-        // locs property which is an array of the locations forming the polygon.
-        var polygons = entities.multipolygon.reduce(function(polygons, m) {
-            return polygons.concat(iD.geo.joinWays(m.members, graph));
-        }, []).concat(entities.closedWay.map(function(d) {
-            var member = [{id: d.id}];
-            member.nodes = graph.childNodes(d);
-            return member;
-        }));
-
-        // contained is an array of arrays of boolean values,
-        // where contained[j][k] is true iff the jth way is
-        // contained by the kth way.
-        var contained = polygons.map(function(w, i) {
-            return polygons.map(function(d, n) {
-                if (i === n) return null;
-                return iD.geo.polygonContainsPolygon(
-                    _.pluck(d.nodes, 'loc'),
-                    _.pluck(w.nodes, 'loc'));
-            });
-        });
-
-        // Sort all polygons as either outer or inner ways
-        var members = [],
-            outer = true;
-
-        while (polygons.length) {
-            extractUncontained(polygons);
-            polygons = polygons.filter(isContained);
-            contained = contained.filter(isContained).map(filterContained);
-        }
-
-        function isContained(d, i) {
-            return _.any(contained[i]);
-        }
-
-        function filterContained(d) {
-            return d.filter(isContained);
-        }
-
-        function extractUncontained(polygons) {
-            polygons.forEach(function(d, i) {
-                if (!isContained(d, i)) {
-                    d.forEach(function(member) {
-                        members.push({
-                            type: 'way',
-                            id: member.id,
-                            role: outer ? 'outer' : 'inner'
-                        });
-                    });
-                }
-            });
-            outer = !outer;
-        }
-
-        // Move all tags to one relation
-        var relation = entities.multipolygon[0] ||
-            iD.Relation({ id: newRelationId, tags: { type: 'multipolygon' }});
-
-        entities.multipolygon.slice(1).forEach(function(m) {
-            relation = relation.mergeTags(m.tags);
-            graph = graph.remove(m);
-        });
-
-        entities.closedWay.forEach(function(way) {
-            function isThisOuter(m) {
-                return m.id === way.id && m.role !== 'inner';
-            }
-            if (members.some(isThisOuter)) {
-                relation = relation.mergeTags(way.tags);
-                graph = graph.replace(way.update({ tags: {} }));
-            }
-        });
-
-        return graph.replace(relation.update({
-            members: members,
-            tags: _.omit(relation.tags, 'area')
-        }));
-    };
-
-    action.disabled = function(graph) {
-        var entities = groupEntities(graph);
-        if (entities.other.length > 0 ||
-            entities.closedWay.length + entities.multipolygon.length < 2)
-            return 'not_eligible';
-        if (!entities.multipolygon.every(function(r) { return r.isComplete(graph); }))
-            return 'incomplete_relation';
-    };
-
-    return action;
-};
-// https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/command/MoveCommand.java
-// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MoveNodeAction.as
-iD.actions.MoveNode = function(nodeId, loc) {
-    return function(graph) {
-        return graph.replace(graph.entity(nodeId).move(loc));
-    };
-};
-iD.actions.Noop = function() {
-    return function(graph) {
-        return graph;
-    };
-};
-// Disconect the ways at the given node.
-//
-// Optionally, disconnect only the given ways.
-//
-// For testing convenience, accepts an ID to assign to the (first) new node.
-// Normally, this will be undefined and the way will automatically
-// be assigned a new ID.
-//
-// This is the inverse of `iD.actions.Connect`.
-//
-// Reference:
-//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/UnjoinNodeAction.as
-//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/UnGlueAction.java
-//
-iD.actions.Disconnect = function(nodeId, newNodeId) {
-    var wayIds;
-
-    var action = function(graph) {
-        var node = graph.entity(nodeId),
-            connections = action.connections(graph);
-
-        connections.forEach(function(connection) {
-            var way = graph.entity(connection.wayID),
-                newNode = iD.Node({id: newNodeId, loc: node.loc, tags: node.tags});
-
-            graph = graph.replace(newNode);
-            if (connection.index === 0 && way.isArea()) {
-                // replace shared node with shared node..
-                graph = graph.replace(way.replaceNode(way.nodes[0], newNode.id));
-            } else {
-                // replace shared node with multiple new nodes..
-                graph = graph.replace(way.updateNode(newNode.id, connection.index));
-            }
-        });
-
-        return graph;
-    };
-
-    action.connections = function(graph) {
-        var candidates = [],
-            keeping = false,
-            parentWays = graph.parentWays(graph.entity(nodeId));
-
-        parentWays.forEach(function(way) {
-            if (wayIds && wayIds.indexOf(way.id) === -1) {
-                keeping = true;
-                return;
-            }
-            if (way.isArea() && (way.nodes[0] === nodeId)) {
-                candidates.push({wayID: way.id, index: 0});
-            } else {
-                way.nodes.forEach(function(waynode, index) {
-                    if (waynode === nodeId) {
-                        candidates.push({wayID: way.id, index: index});
-                    }
-                });
-            }
-        });
-
-        return keeping ? candidates : candidates.slice(1);
-    };
-
-    action.disabled = function(graph) {
-        var connections = action.connections(graph);
-        if (connections.length === 0 || (wayIds && wayIds.length !== connections.length))
-            return 'not_connected';
-
-        var parentWays = graph.parentWays(graph.entity(nodeId)),
-            seenRelationIds = {},
-            sharedRelation;
-
-        parentWays.forEach(function(way) {
-            if (wayIds && wayIds.indexOf(way.id) === -1)
-                return;
-
-            var relations = graph.parentRelations(way);
-            relations.forEach(function(relation) {
-                if (relation.id in seenRelationIds) {
-                    sharedRelation = relation;
-                } else {
-                    seenRelationIds[relation.id] = true;
-                }
-            });
-        });
-
-        if (sharedRelation)
-            return 'relation';
-    };
-
-    action.limitWays = function(_) {
-        if (!arguments.length) return wayIds;
-        wayIds = _;
-        return action;
-    };
-
-    return action;
-};
-iD.actions.ChangePreset = function(entityId, oldPreset, newPreset) {
-    return function(graph) {
-        var entity = graph.entity(entityId),
-            geometry = entity.geometry(graph),
-            tags = entity.tags;
-
-        if (oldPreset) tags = oldPreset.removeTags(tags, geometry);
-        if (newPreset) tags = newPreset.applyTags(tags, geometry);
-
-        return graph.replace(entity.update({tags: tags}));
-    };
-};
-/*
- * Based on https://github.com/openstreetmap/potlatch2/net/systemeD/potlatch2/tools/Straighten.as
- */
-
-iD.actions.Straighten = function(wayId, projection) {
-    function positionAlongWay(n, s, e) {
-        return ((n[0] - s[0]) * (e[0] - s[0]) + (n[1] - s[1]) * (e[1] - s[1]))/
-                (Math.pow(e[0] - s[0], 2) + Math.pow(e[1] - s[1], 2));
-    }
-
-    var action = function(graph) {
-        var way = graph.entity(wayId),
-            nodes = graph.childNodes(way),
-            points = nodes.map(function(n) { return projection(n.loc); }),
-            startPoint = points[0],
-            endPoint = points[points.length-1],
-            toDelete = [],
-            i;
-
-        for (i = 1; i < points.length-1; i++) {
-            var node = nodes[i],
-                point = points[i];
-
-            if (graph.parentWays(node).length > 1 ||
-                graph.parentRelations(node).length ||
-                node.hasInterestingTags()) {
-
-                var u = positionAlongWay(point, startPoint, endPoint),
-                    p0 = startPoint[0] + u * (endPoint[0] - startPoint[0]),
-                    p1 = startPoint[1] + u * (endPoint[1] - startPoint[1]);
-
-                graph = graph.replace(graph.entity(node.id)
-                    .move(projection.invert([p0, p1])));
-            } else {
-                // safe to delete
-                if (toDelete.indexOf(node) === -1) {
-                    toDelete.push(node);
-                }
-            }
-        }
-
-        for (i = 0; i < toDelete.length; i++) {
-            graph = iD.actions.DeleteNode(toDelete[i].id)(graph);
-        }
-
-        return graph;
-    };
-    
-    action.disabled = function(graph) {
-        // check way isn't too bendy
-        var way = graph.entity(wayId),
-            nodes = graph.childNodes(way),
-            points = nodes.map(function(n) { return projection(n.loc); }),
-            startPoint = points[0],
-            endPoint = points[points.length-1],
-            threshold = 0.2 * Math.sqrt(Math.pow(startPoint[0] - endPoint[0], 2) + Math.pow(startPoint[1] - endPoint[1], 2)),
-            i;
-
-        for (i = 1; i < points.length-1; i++) {
-            var point = points[i],
-                u = positionAlongWay(point, startPoint, endPoint),
-                p0 = startPoint[0] + u * (endPoint[0] - startPoint[0]),
-                p1 = startPoint[1] + u * (endPoint[1] - startPoint[1]),
-                dist = Math.sqrt(Math.pow(p0 - point[0], 2) + Math.pow(p1 - point[1], 2));
-
-            // to bendy if point is off by 20% of total start/end distance in projected space
-            if (dist > threshold) {
-                return 'too_bendy';
-            }
-        }
-    };
-
-    return action;
-};
-iD.actions.Revert = function(id) {
-
-    var action = function(graph) {
-        var entity = graph.hasEntity(id),
-            base = graph.base().entities[id];
-
-        if (entity && !base) {    // entity will be removed..
-            if (entity.type === 'node') {
-                graph.parentWays(entity)
-                    .forEach(function(parent) {
-                        parent = parent.removeNode(id);
-                        graph = graph.replace(parent);
-
-                        if (parent.isDegenerate()) {
-                            graph = iD.actions.DeleteWay(parent.id)(graph);
-                        }
-                    });
-            }
-
-            graph.parentRelations(entity)
-                .forEach(function(parent) {
-                    parent = parent.removeMembersWithID(id);
-                    graph = graph.replace(parent);
-
-                    if (parent.isDegenerate()) {
-                        graph = iD.actions.DeleteRelation(parent.id)(graph);
-                    }
-                });
-        }
-
-        return graph.revert(id);
-    };
-
-    return action;
-};
-iD.actions.ChangeTags = function(entityId, tags) {
-    return function(graph) {
-        var entity = graph.entity(entityId);
-        return graph.replace(entity.update({tags: tags}));
-    };
-};
-iD.actions.AddMember = function(relationId, member, memberIndex) {
-    return function(graph) {
-        var relation = graph.entity(relationId);
-
-        if (isNaN(memberIndex) && member.type === 'way') {
-            var members = relation.indexedMembers();
-            members.push(member);
-
-            var joined = iD.geo.joinWays(members, graph);
-            for (var i = 0; i < joined.length; i++) {
-                var segment = joined[i];
-                for (var j = 0; j < segment.length && segment.length >= 2; j++) {
-                    if (segment[j] !== member)
-                        continue;
-
-                    if (j === 0) {
-                        memberIndex = segment[j + 1].index;
-                    } else if (j === segment.length - 1) {
-                        memberIndex = segment[j - 1].index + 1;
-                    } else {
-                        memberIndex = Math.min(segment[j - 1].index + 1, segment[j + 1].index + 1);
-                    }
-                }
-            }
-        }
-
-        return graph.replace(relation.addMember(member, memberIndex));
-    };
-};
 // Remove the effects of `turn.restriction` on `turn`, which must have the
 // following structure:
 //
@@ -22577,6 +22548,35 @@ iD.actions.RotateWay = function(wayId, pivot, angle, projection) {
             });
 
         });
+    };
+};
+iD.actions.AddMember = function(relationId, member, memberIndex) {
+    return function(graph) {
+        var relation = graph.entity(relationId);
+
+        if (isNaN(memberIndex) && member.type === 'way') {
+            var members = relation.indexedMembers();
+            members.push(member);
+
+            var joined = iD.geo.joinWays(members, graph);
+            for (var i = 0; i < joined.length; i++) {
+                var segment = joined[i];
+                for (var j = 0; j < segment.length && segment.length >= 2; j++) {
+                    if (segment[j] !== member)
+                        continue;
+
+                    if (j === 0) {
+                        memberIndex = segment[j + 1].index;
+                    } else if (j === segment.length - 1) {
+                        memberIndex = segment[j - 1].index + 1;
+                    } else {
+                        memberIndex = Math.min(segment[j - 1].index + 1, segment[j + 1].index + 1);
+                    }
+                }
+            }
+        }
+
+        return graph.replace(relation.addMember(member, memberIndex));
     };
 };
 /*
@@ -22837,207 +22837,153 @@ iD.behavior.Select = function(context) {
 
     return behavior;
 };
-/*
-    `iD.behavior.drag` is like `d3.behavior.drag`, with the following differences:
+iD.behavior.Draw = function(context) {
+    var event = d3.dispatch('move', 'click', 'clickWay',
+            'clickNode', 'undo', 'cancel', 'finish'),
+        keybinding = d3.keybinding('draw'),
+        hover = iD.behavior.Hover(context)
+            .altDisables(true)
+            .on('hover', context.ui().sidebar.hover),
+        tail = iD.behavior.Tail(),
+        edit = iD.behavior.Edit(context),
+        closeTolerance = 4,
+        tolerance = 12;
 
-    * The `origin` function is expected to return an [x, y] tuple rather than an
-      {x, y} object.
-    * The events are `start`, `move`, and `end`.
-      (https://github.com/mbostock/d3/issues/563)
-    * The `start` event is not dispatched until the first cursor movement occurs.
-      (https://github.com/mbostock/d3/pull/368)
-    * The `move` event has a `point` and `delta` [x, y] tuple properties rather
-      than `x`, `y`, `dx`, and `dy` properties.
-    * The `end` event is not dispatched if no movement occurs.
-    * An `off` function is available that unbinds the drag's internal event handlers.
-    * Delegation is supported via the `delegate` function.
-
- */
-iD.behavior.drag = function() {
-    function d3_eventCancel() {
-      d3.event.stopPropagation();
-      d3.event.preventDefault();
+    function datum() {
+        if (d3.event.altKey) return {};
+        else return d3.event.target.__data__ || {};
     }
 
-    var event = d3.dispatch('start', 'move', 'end'),
-        origin = null,
-        selector = '',
-        filter = null,
-        event_, target, surface;
-
-    event.of = function(thiz, argumentz) {
-      return function(e1) {
-        var e0 = e1.sourceEvent = d3.event;
-        e1.target = drag;
-        d3.event = e1;
-        try {
-          event[e1.type].apply(thiz, argumentz);
-        } finally {
-          d3.event = e0;
-        }
-      };
-    };
-
-    var d3_event_userSelectProperty = iD.util.prefixCSSProperty('UserSelect'),
-        d3_event_userSelectSuppress = d3_event_userSelectProperty ?
-            function () {
-                var selection = d3.selection(),
-                    select = selection.style(d3_event_userSelectProperty);
-                selection.style(d3_event_userSelectProperty, 'none');
-                return function () {
-                    selection.style(d3_event_userSelectProperty, select);
-                };
-            } :
-            function (type) {
-                var w = d3.select(window).on('selectstart.' + type, d3_eventCancel);
-                return function () {
-                    w.on('selectstart.' + type, null);
-                };
-            };
-
     function mousedown() {
-        target = this;
-        event_ = event.of(target, arguments);
-        var eventTarget = d3.event.target,
-            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
-            offset,
-            origin_ = point(),
-            started = false,
-            selectEnable = d3_event_userSelectSuppress(touchId !== null ? 'drag-' + touchId : 'drag');
-
-        var w = d3.select(window)
-            .on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', dragmove)
-            .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', dragend, true);
-
-        if (origin) {
-            offset = origin.apply(target, arguments);
-            offset = [offset[0] - origin_[0], offset[1] - origin_[1]];
-        } else {
-            offset = [0, 0];
-        }
-
-        if (touchId === null) d3.event.stopPropagation();
 
         function point() {
-            var p = target.parentNode || surface;
+            var p = context.container().node();
             return touchId !== null ? d3.touches(p).filter(function(p) {
                 return p.identifier === touchId;
             })[0] : d3.mouse(p);
         }
 
-        function dragmove() {
+        var element = d3.select(this),
+            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
+            t1 = +new Date(),
+            p1 = point();
 
-            var p = point(),
-                dx = p[0] - origin_[0],
-                dy = p[1] - origin_[1];
-            
-            if (dx === 0 && dy === 0)
-                return;
+        element.on('mousemove.draw', null);
 
-            if (!started) {
-                started = true;
-                event_({
-                    type: 'start'
-                });
+        d3.select(window).on('mouseup.draw', function() {
+            var t2 = +new Date(),
+                p2 = point(),
+                dist = iD.geo.euclideanDistance(p1, p2);
+
+            element.on('mousemove.draw', mousemove);
+            d3.select(window).on('mouseup.draw', null);
+
+            if (dist < closeTolerance || (dist < tolerance && (t2 - t1) < 500)) {
+                // Prevent a quick second click
+                d3.select(window).on('click.draw-block', function() {
+                    d3.event.stopPropagation();
+                }, true);
+
+                context.map().dblclickEnable(false);
+
+                window.setTimeout(function() {
+                    context.map().dblclickEnable(true);
+                    d3.select(window).on('click.draw-block', null);
+                }, 500);
+
+                click();
             }
+        });
+    }
 
-            origin_ = p;
-            d3_eventCancel();
+    function mousemove() {
+        event.move(datum());
+    }
 
-            event_({
-                type: 'move',
-                point: [p[0] + offset[0],  p[1] + offset[1]],
-                delta: [dx, dy]
-            });
-        }
+    function click() {
+        var d = datum();
+        if (d.type === 'way') {
+            var choice = iD.geo.chooseEdge(context.childNodes(d), context.mouse(), context.projection),
+                edge = [d.nodes[choice.index - 1], d.nodes[choice.index]];
+            event.clickWay(choice.loc, edge);
 
-        function dragend() {
-            if (started) {
-                event_({
-                    type: 'end'
-                });
+        } else if (d.type === 'node') {
+            event.clickNode(d);
 
-                d3_eventCancel();
-                if (d3.event.target === eventTarget) w.on('click.drag', click, true);
-            }
-
-            w.on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', null)
-                .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', null);
-            selectEnable();
-        }
-
-        function click() {
-            d3_eventCancel();
-            w.on('click.drag', null);
+        } else {
+            event.click(context.map().mouseCoordinates());
         }
     }
 
-    function drag(selection) {
-        var matchesSelector = iD.util.prefixDOMProperty('matchesSelector'),
-            delegate = mousedown;
-
-        if (selector) {
-            delegate = function() {
-                var root = this,
-                    target = d3.event.target;
-                for (; target && target !== root; target = target.parentNode) {
-                    if (target[matchesSelector](selector) &&
-                            (!filter || filter(target.__data__))) {
-                        return mousedown.call(target, target.__data__);
-                    }
-                }
-            };
-        }
-
-        selection.on('mousedown.drag' + selector, delegate)
-            .on('touchstart.drag' + selector, delegate);
+    function backspace() {
+        d3.event.preventDefault();
+        event.undo();
     }
 
-    drag.off = function(selection) {
-        selection.on('mousedown.drag' + selector, null)
-            .on('touchstart.drag' + selector, null);
-    };
+    function del() {
+        d3.event.preventDefault();
+        event.cancel();
+    }
 
-    drag.delegate = function(_) {
-        if (!arguments.length) return selector;
-        selector = _;
-        return drag;
-    };
+    function ret() {
+        d3.event.preventDefault();
+        event.finish();
+    }
 
-    drag.filter = function(_) {
-        if (!arguments.length) return origin;
-        filter = _;
-        return drag;
-    };
+    function draw(selection) {
+        context.install(hover);
+        context.install(edit);
 
-    drag.origin = function (_) {
-        if (!arguments.length) return origin;
-        origin = _;
-        return drag;
-    };
+        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
+            context.install(tail);
+        }
 
-    drag.cancel = function() {
+        keybinding
+            .on('⌫', backspace)
+            .on('⌦', del)
+            .on('⎋', ret)
+            .on('↩', ret);
+
+        selection
+            .on('mousedown.draw', mousedown)
+            .on('mousemove.draw', mousemove);
+
+        d3.select(document)
+            .call(keybinding);
+
+        return draw;
+    }
+
+    draw.off = function(selection) {
+        context.ui().sidebar.hover.cancel();
+        context.uninstall(hover);
+        context.uninstall(edit);
+
+        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
+            context.uninstall(tail);
+            iD.behavior.Draw.usedTails[tail.text()] = true;
+        }
+
+        selection
+            .on('mousedown.draw', null)
+            .on('mousemove.draw', null);
+
         d3.select(window)
-            .on('mousemove.drag', null)
-            .on('mouseup.drag', null);
-        return drag;
+            .on('mouseup.draw', null);
+
+        d3.select(document)
+            .call(keybinding.off);
     };
 
-    drag.target = function() {
-        if (!arguments.length) return target;
-        target = arguments[0];
-        event_ = event.of(target, Array.prototype.slice.call(arguments, 1));
-        return drag;
+    draw.tail = function(_) {
+        tail.text(_);
+        return draw;
     };
 
-    drag.surface = function() {
-        if (!arguments.length) return surface;
-        surface = arguments[0];
-        return drag;
-    };
-
-    return d3.rebind(drag, event, 'on');
+    return d3.rebind(draw, event, 'on');
 };
+
+iD.behavior.Draw.usedTails = {};
 iD.behavior.Breathe = function() {
     var duration = 800,
         selector = '.selected.shadow, .selected .shadow',
@@ -23418,153 +23364,207 @@ iD.behavior.Lasso = function(context) {
 
     return behavior;
 };
-iD.behavior.Draw = function(context) {
-    var event = d3.dispatch('move', 'click', 'clickWay',
-            'clickNode', 'undo', 'cancel', 'finish'),
-        keybinding = d3.keybinding('draw'),
-        hover = iD.behavior.Hover(context)
-            .altDisables(true)
-            .on('hover', context.ui().sidebar.hover),
-        tail = iD.behavior.Tail(),
-        edit = iD.behavior.Edit(context),
-        closeTolerance = 4,
-        tolerance = 12;
+/*
+    `iD.behavior.drag` is like `d3.behavior.drag`, with the following differences:
 
-    function datum() {
-        if (d3.event.altKey) return {};
-        else return d3.event.target.__data__ || {};
+    * The `origin` function is expected to return an [x, y] tuple rather than an
+      {x, y} object.
+    * The events are `start`, `move`, and `end`.
+      (https://github.com/mbostock/d3/issues/563)
+    * The `start` event is not dispatched until the first cursor movement occurs.
+      (https://github.com/mbostock/d3/pull/368)
+    * The `move` event has a `point` and `delta` [x, y] tuple properties rather
+      than `x`, `y`, `dx`, and `dy` properties.
+    * The `end` event is not dispatched if no movement occurs.
+    * An `off` function is available that unbinds the drag's internal event handlers.
+    * Delegation is supported via the `delegate` function.
+
+ */
+iD.behavior.drag = function() {
+    function d3_eventCancel() {
+      d3.event.stopPropagation();
+      d3.event.preventDefault();
     }
 
+    var event = d3.dispatch('start', 'move', 'end'),
+        origin = null,
+        selector = '',
+        filter = null,
+        event_, target, surface;
+
+    event.of = function(thiz, argumentz) {
+      return function(e1) {
+        var e0 = e1.sourceEvent = d3.event;
+        e1.target = drag;
+        d3.event = e1;
+        try {
+          event[e1.type].apply(thiz, argumentz);
+        } finally {
+          d3.event = e0;
+        }
+      };
+    };
+
+    var d3_event_userSelectProperty = iD.util.prefixCSSProperty('UserSelect'),
+        d3_event_userSelectSuppress = d3_event_userSelectProperty ?
+            function () {
+                var selection = d3.selection(),
+                    select = selection.style(d3_event_userSelectProperty);
+                selection.style(d3_event_userSelectProperty, 'none');
+                return function () {
+                    selection.style(d3_event_userSelectProperty, select);
+                };
+            } :
+            function (type) {
+                var w = d3.select(window).on('selectstart.' + type, d3_eventCancel);
+                return function () {
+                    w.on('selectstart.' + type, null);
+                };
+            };
+
     function mousedown() {
+        target = this;
+        event_ = event.of(target, arguments);
+        var eventTarget = d3.event.target,
+            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
+            offset,
+            origin_ = point(),
+            started = false,
+            selectEnable = d3_event_userSelectSuppress(touchId !== null ? 'drag-' + touchId : 'drag');
+
+        var w = d3.select(window)
+            .on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', dragmove)
+            .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', dragend, true);
+
+        if (origin) {
+            offset = origin.apply(target, arguments);
+            offset = [offset[0] - origin_[0], offset[1] - origin_[1]];
+        } else {
+            offset = [0, 0];
+        }
+
+        if (touchId === null) d3.event.stopPropagation();
 
         function point() {
-            var p = context.container().node();
+            var p = target.parentNode || surface;
             return touchId !== null ? d3.touches(p).filter(function(p) {
                 return p.identifier === touchId;
             })[0] : d3.mouse(p);
         }
 
-        var element = d3.select(this),
-            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
-            t1 = +new Date(),
-            p1 = point();
+        function dragmove() {
 
-        element.on('mousemove.draw', null);
+            var p = point(),
+                dx = p[0] - origin_[0],
+                dy = p[1] - origin_[1];
+            
+            if (dx === 0 && dy === 0)
+                return;
 
-        d3.select(window).on('mouseup.draw', function() {
-            var t2 = +new Date(),
-                p2 = point(),
-                dist = iD.geo.euclideanDistance(p1, p2);
-
-            element.on('mousemove.draw', mousemove);
-            d3.select(window).on('mouseup.draw', null);
-
-            if (dist < closeTolerance || (dist < tolerance && (t2 - t1) < 500)) {
-                // Prevent a quick second click
-                d3.select(window).on('click.draw-block', function() {
-                    d3.event.stopPropagation();
-                }, true);
-
-                context.map().dblclickEnable(false);
-
-                window.setTimeout(function() {
-                    context.map().dblclickEnable(true);
-                    d3.select(window).on('click.draw-block', null);
-                }, 500);
-
-                click();
+            if (!started) {
+                started = true;
+                event_({
+                    type: 'start'
+                });
             }
-        });
-    }
 
-    function mousemove() {
-        event.move(datum());
-    }
+            origin_ = p;
+            d3_eventCancel();
 
-    function click() {
-        var d = datum();
-        if (d.type === 'way') {
-            var choice = iD.geo.chooseEdge(context.childNodes(d), context.mouse(), context.projection),
-                edge = [d.nodes[choice.index - 1], d.nodes[choice.index]];
-            event.clickWay(choice.loc, edge);
+            event_({
+                type: 'move',
+                point: [p[0] + offset[0],  p[1] + offset[1]],
+                delta: [dx, dy]
+            });
+        }
 
-        } else if (d.type === 'node') {
-            event.clickNode(d);
+        function dragend() {
+            if (started) {
+                event_({
+                    type: 'end'
+                });
 
-        } else {
-            event.click(context.map().mouseCoordinates());
+                d3_eventCancel();
+                if (d3.event.target === eventTarget) w.on('click.drag', click, true);
+            }
+
+            w.on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', null)
+                .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', null);
+            selectEnable();
+        }
+
+        function click() {
+            d3_eventCancel();
+            w.on('click.drag', null);
         }
     }
 
-    function backspace() {
-        d3.event.preventDefault();
-        event.undo();
-    }
+    function drag(selection) {
+        var matchesSelector = iD.util.prefixDOMProperty('matchesSelector'),
+            delegate = mousedown;
 
-    function del() {
-        d3.event.preventDefault();
-        event.cancel();
-    }
-
-    function ret() {
-        d3.event.preventDefault();
-        event.finish();
-    }
-
-    function draw(selection) {
-        context.install(hover);
-        context.install(edit);
-
-        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
-            context.install(tail);
+        if (selector) {
+            delegate = function() {
+                var root = this,
+                    target = d3.event.target;
+                for (; target && target !== root; target = target.parentNode) {
+                    if (target[matchesSelector](selector) &&
+                            (!filter || filter(target.__data__))) {
+                        return mousedown.call(target, target.__data__);
+                    }
+                }
+            };
         }
 
-        keybinding
-            .on('⌫', backspace)
-            .on('⌦', del)
-            .on('⎋', ret)
-            .on('↩', ret);
-
-        selection
-            .on('mousedown.draw', mousedown)
-            .on('mousemove.draw', mousemove);
-
-        d3.select(document)
-            .call(keybinding);
-
-        return draw;
+        selection.on('mousedown.drag' + selector, delegate)
+            .on('touchstart.drag' + selector, delegate);
     }
 
-    draw.off = function(selection) {
-        context.ui().sidebar.hover.cancel();
-        context.uninstall(hover);
-        context.uninstall(edit);
+    drag.off = function(selection) {
+        selection.on('mousedown.drag' + selector, null)
+            .on('touchstart.drag' + selector, null);
+    };
 
-        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
-            context.uninstall(tail);
-            iD.behavior.Draw.usedTails[tail.text()] = true;
-        }
+    drag.delegate = function(_) {
+        if (!arguments.length) return selector;
+        selector = _;
+        return drag;
+    };
 
-        selection
-            .on('mousedown.draw', null)
-            .on('mousemove.draw', null);
+    drag.filter = function(_) {
+        if (!arguments.length) return origin;
+        filter = _;
+        return drag;
+    };
 
+    drag.origin = function (_) {
+        if (!arguments.length) return origin;
+        origin = _;
+        return drag;
+    };
+
+    drag.cancel = function() {
         d3.select(window)
-            .on('mouseup.draw', null);
-
-        d3.select(document)
-            .call(keybinding.off);
+            .on('mousemove.drag', null)
+            .on('mouseup.drag', null);
+        return drag;
     };
 
-    draw.tail = function(_) {
-        tail.text(_);
-        return draw;
+    drag.target = function() {
+        if (!arguments.length) return target;
+        target = arguments[0];
+        event_ = event.of(target, Array.prototype.slice.call(arguments, 1));
+        return drag;
     };
 
-    return d3.rebind(draw, event, 'on');
+    drag.surface = function() {
+        if (!arguments.length) return surface;
+        surface = arguments[0];
+        return drag;
+    };
+
+    return d3.rebind(drag, event, 'on');
 };
-
-iD.behavior.Draw.usedTails = {};
 iD.behavior.Copy = function(context) {
     var keybinding = d3.keybinding('copy');
 
@@ -25786,48 +25786,6 @@ iD.operations.Move = function(selectedIDs, context) {
 
     return operation;
 };
-iD.operations.Orthogonalize = function(selectedIDs, context) {
-    var entityId = selectedIDs[0],
-        entity = context.entity(entityId),
-        extent = entity.extent(context.graph()),
-        geometry = context.geometry(entityId),
-        action = iD.actions.Orthogonalize(entityId, context.projection);
-
-    var operation = function() {
-        var annotation = t('operations.orthogonalize.annotation.' + geometry);
-        context.perform(action, annotation);
-    };
-
-    operation.available = function() {
-        return selectedIDs.length === 1 &&
-            entity.type === 'way' &&
-            entity.isClosed() &&
-            _.uniq(entity.nodes).length > 2;
-    };
-
-    operation.disabled = function() {
-        var reason;
-        if (extent.percentContainedIn(context.extent()) < 0.8) {
-            reason = 'too_large';
-        } else if (context.hasHiddenConnections(entityId)) {
-            reason = 'connected_to_hidden';
-        }
-        return action.disabled(context.graph()) || reason;
-    };
-
-    operation.tooltip = function() {
-        var disable = operation.disabled();
-        return disable ?
-            t('operations.orthogonalize.' + disable) :
-            t('operations.orthogonalize.description.' + geometry);
-    };
-
-    operation.id = 'orthogonalize';
-    operation.keys = [t('operations.orthogonalize.key')];
-    operation.title = t('operations.orthogonalize.title');
-
-    return operation;
-};
 iD.operations.Disconnect = function(selectedIDs, context) {
     var vertices = _.filter(selectedIDs, function vertex(entityId) {
         return context.geometry(entityId) === 'vertex';
@@ -25948,6 +25906,48 @@ iD.operations.Straighten = function(selectedIDs, context) {
     operation.id = 'straighten';
     operation.keys = [t('operations.straighten.key')];
     operation.title = t('operations.straighten.title');
+
+    return operation;
+};
+iD.operations.Orthogonalize = function(selectedIDs, context) {
+    var entityId = selectedIDs[0],
+        entity = context.entity(entityId),
+        extent = entity.extent(context.graph()),
+        geometry = context.geometry(entityId),
+        action = iD.actions.Orthogonalize(entityId, context.projection);
+
+    var operation = function() {
+        var annotation = t('operations.orthogonalize.annotation.' + geometry);
+        context.perform(action, annotation);
+    };
+
+    operation.available = function() {
+        return selectedIDs.length === 1 &&
+            entity.type === 'way' &&
+            entity.isClosed() &&
+            _.uniq(entity.nodes).length > 2;
+    };
+
+    operation.disabled = function() {
+        var reason;
+        if (extent.percentContainedIn(context.extent()) < 0.8) {
+            reason = 'too_large';
+        } else if (context.hasHiddenConnections(entityId)) {
+            reason = 'connected_to_hidden';
+        }
+        return action.disabled(context.graph()) || reason;
+    };
+
+    operation.tooltip = function() {
+        var disable = operation.disabled();
+        return disable ?
+            t('operations.orthogonalize.' + disable) :
+            t('operations.orthogonalize.description.' + geometry);
+    };
+
+    operation.id = 'orthogonalize';
+    operation.keys = [t('operations.orthogonalize.key')];
+    operation.title = t('operations.orthogonalize.title');
 
     return operation;
 };
@@ -26606,148 +26606,6 @@ iD.Tree = function(head) {
 
     return tree;
 };
-iD.Entity = function(attrs) {
-    // For prototypal inheritance.
-    if (this instanceof iD.Entity) return;
-
-    // Create the appropriate subtype.
-    if (attrs && attrs.type) {
-        return iD.Entity[attrs.type].apply(this, arguments);
-    } else if (attrs && attrs.id) {
-        return iD.Entity[iD.Entity.id.type(attrs.id)].apply(this, arguments);
-    }
-
-    // Initialize a generic Entity (used only in tests).
-    return (new iD.Entity()).initialize(arguments);
-};
-
-iD.Entity.id = function(type) {
-    return iD.Entity.id.fromOSM(type, iD.Entity.id.next[type]--);
-};
-
-iD.Entity.id.next = {node: -1, way: -1, relation: -1};
-
-iD.Entity.id.fromOSM = function(type, id) {
-    return type[0] + id;
-};
-
-iD.Entity.id.toOSM = function(id) {
-    return id.slice(1);
-};
-
-iD.Entity.id.type = function(id) {
-    return {'n': 'node', 'w': 'way', 'r': 'relation'}[id[0]];
-};
-
-// A function suitable for use as the second argument to d3.selection#data().
-iD.Entity.key = function(entity) {
-    return entity.id + 'v' + (entity.v || 0);
-};
-
-iD.Entity.prototype = {
-    tags: {},
-
-    initialize: function(sources) {
-        for (var i = 0; i < sources.length; ++i) {
-            var source = sources[i];
-            for (var prop in source) {
-                if (Object.prototype.hasOwnProperty.call(source, prop)) {
-                    if (source[prop] === undefined) {
-                        delete this[prop];
-                    } else {
-                        this[prop] = source[prop];
-                    }
-                }
-            }
-        }
-
-        if (!this.id && this.type) {
-            this.id = iD.Entity.id(this.type);
-        }
-        if (!this.hasOwnProperty('visible')) {
-            this.visible = true;
-        }
-
-        if (iD.debug) {
-            Object.freeze(this);
-            Object.freeze(this.tags);
-
-            if (this.loc) Object.freeze(this.loc);
-            if (this.nodes) Object.freeze(this.nodes);
-            if (this.members) Object.freeze(this.members);
-        }
-
-        return this;
-    },
-
-    copy: function() {
-        // Returns an array so that we can support deep copying ways and relations.
-        // The first array element will contain this.copy, followed by any descendants.
-        return [iD.Entity(this, {id: undefined, user: undefined, version: undefined})];
-    },
-
-    osmId: function() {
-        return iD.Entity.id.toOSM(this.id);
-    },
-
-    isNew: function() {
-        return this.osmId() < 0;
-    },
-
-    update: function(attrs) {
-        return iD.Entity(this, attrs, {v: 1 + (this.v || 0)});
-    },
-
-    mergeTags: function(tags) {
-        var merged = _.clone(this.tags), changed = false;
-        for (var k in tags) {
-            var t1 = merged[k],
-                t2 = tags[k];
-            if (!t1) {
-                changed = true;
-                merged[k] = t2;
-            } else if (t1 !== t2) {
-                changed = true;
-                merged[k] = _.union(t1.split(/;\s*/), t2.split(/;\s*/)).join(';');
-            }
-        }
-        return changed ? this.update({tags: merged}) : this;
-    },
-
-    intersects: function(extent, resolver) {
-        return this.extent(resolver).intersects(extent);
-    },
-
-    isUsed: function(resolver) {
-        return _.without(Object.keys(this.tags), 'area').length > 0 ||
-            resolver.parentRelations(this).length > 0;
-    },
-
-    hasInterestingTags: function() {
-        return _.keys(this.tags).some(iD.interestingTag);
-    },
-
-    isHighwayIntersection: function() {
-        return false;
-    },
-
-    deprecatedTags: function() {
-        var tags = _.pairs(this.tags);
-        var deprecated = {};
-
-        iD.data.deprecated.forEach(function(d) {
-            var match = _.pairs(d.old)[0];
-            tags.forEach(function(t) {
-                if (t[0] === match[0] &&
-                    (t[1] === match[1] || match[1] === '*')) {
-                    deprecated[t[0]] = t[1];
-                }
-            });
-        });
-
-        return deprecated;
-    }
-};
 iD.Relation = iD.Entity.relation = function iD_Relation() {
     if (!(this instanceof iD_Relation)) {
         return (new iD_Relation()).initialize(arguments);
@@ -27255,6 +27113,76 @@ iD.interestingTag = function (key) {
         key.indexOf('tiger:') !== 0;
 
 };
+iD.Node = iD.Entity.node = function iD_Node() {
+    if (!(this instanceof iD_Node)) {
+        return (new iD_Node()).initialize(arguments);
+    } else if (arguments.length) {
+        this.initialize(arguments);
+    }
+};
+
+iD.Node.prototype = Object.create(iD.Entity.prototype);
+
+_.extend(iD.Node.prototype, {
+    type: 'node',
+
+    extent: function() {
+        return new iD.geo.Extent(this.loc);
+    },
+
+    geometry: function(graph) {
+        return graph.transient(this, 'geometry', function() {
+            return graph.isPoi(this) ? 'point' : 'vertex';
+        });
+    },
+
+    move: function(loc) {
+        return this.update({loc: loc});
+    },
+
+    isIntersection: function(resolver) {
+        return resolver.transient(this, 'isIntersection', function() {
+            return resolver.parentWays(this).filter(function(parent) {
+                return (parent.tags.highway ||
+                    parent.tags.waterway ||
+                    parent.tags.railway ||
+                    parent.tags.aeroway) &&
+                    parent.geometry(resolver) === 'line';
+            }).length > 1;
+        });
+    },
+
+    isHighwayIntersection: function(resolver) {
+        return resolver.transient(this, 'isHighwayIntersection', function() {
+            return resolver.parentWays(this).filter(function(parent) {
+                return parent.tags.highway && parent.geometry(resolver) === 'line';
+            }).length > 1;
+        });
+    },
+
+    asJXON: function(changeset_id) {
+        var r = {
+            node: {
+                '@id': this.osmId(),
+                '@lon': this.loc[0],
+                '@lat': this.loc[1],
+                '@version': (this.version || 0),
+                tag: _.map(this.tags, function(v, k) {
+                    return { keyAttributes: { k: k, v: v } };
+                })
+            }
+        };
+        if (changeset_id) r.node['@changeset'] = changeset_id;
+        return r;
+    },
+
+    asGeoJSON: function() {
+        return {
+            type: 'Point',
+            coordinates: this.loc
+        };
+    }
+});
 iD.Connection = function(useHttps) {
     if (typeof useHttps !== 'boolean') {
       useHttps = window.location.protocol === 'https:';
@@ -27509,7 +27437,7 @@ iD.Connection = function(useHttps) {
     connection.changesetTags = function(comment, imageryUsed) {
         var detected = iD.detect(),
             tags = {
-                created_by: 'iD ' + iD.version,
+                created_by: 'Strava iD ' + iD.version,
                 imagery_used: imageryUsed.join(';').substr(0, 255),
                 host: (window.location.origin + window.location.pathname).substr(0, 255),
                 locale: detected.locale
@@ -27724,76 +27652,148 @@ iD.Connection = function(useHttps) {
 
     return d3.rebind(connection, event, 'on');
 };
-iD.Node = iD.Entity.node = function iD_Node() {
-    if (!(this instanceof iD_Node)) {
-        return (new iD_Node()).initialize(arguments);
-    } else if (arguments.length) {
-        this.initialize(arguments);
+iD.Entity = function(attrs) {
+    // For prototypal inheritance.
+    if (this instanceof iD.Entity) return;
+
+    // Create the appropriate subtype.
+    if (attrs && attrs.type) {
+        return iD.Entity[attrs.type].apply(this, arguments);
+    } else if (attrs && attrs.id) {
+        return iD.Entity[iD.Entity.id.type(attrs.id)].apply(this, arguments);
     }
+
+    // Initialize a generic Entity (used only in tests).
+    return (new iD.Entity()).initialize(arguments);
 };
 
-iD.Node.prototype = Object.create(iD.Entity.prototype);
+iD.Entity.id = function(type) {
+    return iD.Entity.id.fromOSM(type, iD.Entity.id.next[type]--);
+};
 
-_.extend(iD.Node.prototype, {
-    type: 'node',
+iD.Entity.id.next = {node: -1, way: -1, relation: -1};
 
-    extent: function() {
-        return new iD.geo.Extent(this.loc);
-    },
+iD.Entity.id.fromOSM = function(type, id) {
+    return type[0] + id;
+};
 
-    geometry: function(graph) {
-        return graph.transient(this, 'geometry', function() {
-            return graph.isPoi(this) ? 'point' : 'vertex';
-        });
-    },
+iD.Entity.id.toOSM = function(id) {
+    return id.slice(1);
+};
 
-    move: function(loc) {
-        return this.update({loc: loc});
-    },
+iD.Entity.id.type = function(id) {
+    return {'n': 'node', 'w': 'way', 'r': 'relation'}[id[0]];
+};
 
-    isIntersection: function(resolver) {
-        return resolver.transient(this, 'isIntersection', function() {
-            return resolver.parentWays(this).filter(function(parent) {
-                return (parent.tags.highway ||
-                    parent.tags.waterway ||
-                    parent.tags.railway ||
-                    parent.tags.aeroway) &&
-                    parent.geometry(resolver) === 'line';
-            }).length > 1;
-        });
-    },
+// A function suitable for use as the second argument to d3.selection#data().
+iD.Entity.key = function(entity) {
+    return entity.id + 'v' + (entity.v || 0);
+};
 
-    isHighwayIntersection: function(resolver) {
-        return resolver.transient(this, 'isHighwayIntersection', function() {
-            return resolver.parentWays(this).filter(function(parent) {
-                return parent.tags.highway && parent.geometry(resolver) === 'line';
-            }).length > 1;
-        });
-    },
+iD.Entity.prototype = {
+    tags: {},
 
-    asJXON: function(changeset_id) {
-        var r = {
-            node: {
-                '@id': this.osmId(),
-                '@lon': this.loc[0],
-                '@lat': this.loc[1],
-                '@version': (this.version || 0),
-                tag: _.map(this.tags, function(v, k) {
-                    return { keyAttributes: { k: k, v: v } };
-                })
+    initialize: function(sources) {
+        for (var i = 0; i < sources.length; ++i) {
+            var source = sources[i];
+            for (var prop in source) {
+                if (Object.prototype.hasOwnProperty.call(source, prop)) {
+                    if (source[prop] === undefined) {
+                        delete this[prop];
+                    } else {
+                        this[prop] = source[prop];
+                    }
+                }
             }
-        };
-        if (changeset_id) r.node['@changeset'] = changeset_id;
-        return r;
+        }
+
+        if (!this.id && this.type) {
+            this.id = iD.Entity.id(this.type);
+        }
+        if (!this.hasOwnProperty('visible')) {
+            this.visible = true;
+        }
+
+        if (iD.debug) {
+            Object.freeze(this);
+            Object.freeze(this.tags);
+
+            if (this.loc) Object.freeze(this.loc);
+            if (this.nodes) Object.freeze(this.nodes);
+            if (this.members) Object.freeze(this.members);
+        }
+
+        return this;
     },
 
-    asGeoJSON: function() {
-        return {
-            type: 'Point',
-            coordinates: this.loc
-        };
+    copy: function() {
+        // Returns an array so that we can support deep copying ways and relations.
+        // The first array element will contain this.copy, followed by any descendants.
+        return [iD.Entity(this, {id: undefined, user: undefined, version: undefined})];
+    },
+
+    osmId: function() {
+        return iD.Entity.id.toOSM(this.id);
+    },
+
+    isNew: function() {
+        return this.osmId() < 0;
+    },
+
+    update: function(attrs) {
+        return iD.Entity(this, attrs, {v: 1 + (this.v || 0)});
+    },
+
+    mergeTags: function(tags) {
+        var merged = _.clone(this.tags), changed = false;
+        for (var k in tags) {
+            var t1 = merged[k],
+                t2 = tags[k];
+            if (!t1) {
+                changed = true;
+                merged[k] = t2;
+            } else if (t1 !== t2) {
+                changed = true;
+                merged[k] = _.union(t1.split(/;\s*/), t2.split(/;\s*/)).join(';');
+            }
+        }
+        return changed ? this.update({tags: merged}) : this;
+    },
+
+    intersects: function(extent, resolver) {
+        return this.extent(resolver).intersects(extent);
+    },
+
+    isUsed: function(resolver) {
+        return _.without(Object.keys(this.tags), 'area').length > 0 ||
+            resolver.parentRelations(this).length > 0;
+    },
+
+    hasInterestingTags: function() {
+        return _.keys(this.tags).some(iD.interestingTag);
+    },
+
+    isHighwayIntersection: function() {
+        return false;
+    },
+
+    deprecatedTags: function() {
+        var tags = _.pairs(this.tags);
+        var deprecated = {};
+
+        iD.data.deprecated.forEach(function(d) {
+            var match = _.pairs(d.old)[0];
+            tags.forEach(function(t) {
+                if (t[0] === match[0] &&
+                    (t[1] === match[1] || match[1] === '*')) {
+                    deprecated[t[0]] = t[1];
+                }
+            });
+        });
+
+        return deprecated;
     }
-});
+};
 iD.Way = iD.Entity.way = function iD_Way() {
     if (!(this instanceof iD_Way)) {
         return (new iD_Way()).initialize(arguments);
@@ -30209,193 +30209,6 @@ iD.svg = {
         };
     }
 };
-iD.svg.Vertices = function(projection, context) {
-    var radiuses = {
-        //       z16-, z17, z18+, tagged
-        shadow: [6,    7.5,   7.5,  11.5],
-        stroke: [2.5,  3.5,   3.5,  7],
-        fill:   [1,    1.5,   1.5,  1.5]
-    };
-
-    var hover;
-
-    function siblingAndChildVertices(ids, graph, extent) {
-        var vertices = {};
-
-        function addChildVertices(entity) {
-            if (!context.features().isHiddenFeature(entity, graph, entity.geometry(graph))) {
-                var i;
-                if (entity.type === 'way') {
-                    for (i = 0; i < entity.nodes.length; i++) {
-                        addChildVertices(graph.entity(entity.nodes[i]));
-                    }
-                } else if (entity.type === 'relation') {
-                    for (i = 0; i < entity.members.length; i++) {
-                        var member = context.hasEntity(entity.members[i].id);
-                        if (member) {
-                            addChildVertices(member);
-                        }
-                    }
-                } else if (entity.intersects(extent, graph)) {
-                    vertices[entity.id] = entity;
-                }
-            }
-        }
-
-        ids.forEach(function(id) {
-            var entity = context.hasEntity(id);
-            if (entity && entity.type === 'node') {
-                vertices[entity.id] = entity;
-                context.graph().parentWays(entity).forEach(function(entity) {
-                    addChildVertices(entity);
-                });
-            } else if (entity) {
-                addChildVertices(entity);
-            }
-        });
-
-        return vertices;
-    }
-
-    function draw(selection, vertices, klass, graph, zoom) {
-        var icons = {},
-            z;
-
-        if (zoom < 17) {
-            z = 0;
-        } else if (zoom < 18) {
-            z = 1;
-        } else {
-            z = 2;
-        }
-
-        var groups = selection.data(vertices, function(entity) {
-            return iD.Entity.key(entity);
-        });
-
-        function icon(entity) {
-            if (entity.id in icons) return icons[entity.id];
-            icons[entity.id] =
-                entity.hasInterestingTags() &&
-                context.presets().match(entity, graph).icon;
-            return icons[entity.id];
-        }
-
-        function setClass(klass) {
-            return function(entity) {
-                this.setAttribute('class', 'node vertex ' + klass + ' ' + entity.id);
-            };
-        }
-
-        function setAttributes(selection) {
-            ['shadow','stroke','fill'].forEach(function(klass) {
-                var rads = radiuses[klass];
-                selection.selectAll('.' + klass)
-                    .each(function(entity) {
-                        var i = z && icon(entity),
-                            c = i ? 0.5 : 0,
-                            r = rads[i ? 3 : z];
-                        this.setAttribute('cx', c);
-                        this.setAttribute('cy', -c);
-                        this.setAttribute('r', r);
-                        if (i && klass === 'fill') {
-                            this.setAttribute('visibility', 'hidden');
-                        } else {
-                            this.removeAttribute('visibility');
-                        }
-                    });
-            });
-
-            selection.selectAll('use')
-                .each(function() {
-                    if (z) {
-                        this.removeAttribute('visibility');
-                    } else {
-                        this.setAttribute('visibility', 'hidden');
-                    }
-                });
-        }
-
-        var enter = groups.enter()
-            .append('g')
-            .attr('class', function(d) { return 'node vertex ' + klass + ' ' + d.id; });
-
-        enter.append('circle')
-            .each(setClass('shadow'));
-
-        enter.append('circle')
-            .each(setClass('stroke'));
-
-        // Vertices with icons get a `use`.
-        enter.filter(function(d) { return icon(d); })
-            .append('use')
-            .attr('transform', 'translate(-6, -6)')
-            .attr('xlink:href', function(d) { return '#' + icon(d) + '-12'; })
-            .attr('width', '12px')
-            .attr('height', '12px')
-            .each(setClass('icon'));
-
-        // Vertices with tags get a fill.
-        enter.filter(function(d) { return d.hasInterestingTags(); })
-            .append('circle')
-            .each(setClass('fill'));
-
-        groups
-            .attr('transform', iD.svg.PointTransform(projection))
-            .classed('shared', function(entity) { return graph.isShared(entity); })
-            .call(setAttributes);
-
-        groups.exit()
-            .remove();
-    }
-
-    function drawVertices(surface, graph, entities, filter, extent, zoom) {
-        var selected = siblingAndChildVertices(context.selectedIDs(), graph, extent),
-            wireframe = surface.classed('fill-wireframe'),
-            vertices = [];
-
-        for (var i = 0; i < entities.length; i++) {
-            var entity = entities[i],
-                geometry = entity.geometry(graph);
-
-            if (wireframe && geometry === 'point') {
-                vertices.push(entity);
-                continue;
-            }
-
-            if (geometry !== 'vertex')
-                continue;
-
-            if (entity.id in selected ||
-                entity.hasInterestingTags() ||
-                entity.isIntersection(graph)) {
-                vertices.push(entity);
-            }
-        }
-
-        surface.select('.layer-hit').selectAll('g.vertex.vertex-persistent')
-            .filter(filter)
-            .call(draw, vertices, 'vertex-persistent', graph, zoom);
-
-        drawHover(surface, graph, extent, zoom);
-    }
-
-    function drawHover(surface, graph, extent, zoom) {
-        var hovered = hover ? siblingAndChildVertices([hover.id], graph, extent) : {};
-
-        surface.select('.layer-hit').selectAll('g.vertex.vertex-hover')
-            .call(draw, d3.values(hovered), 'vertex-hover', graph, zoom);
-    }
-
-    drawVertices.drawHover = function(surface, graph, _, extent, zoom) {
-        if (hover !== _) {
-            hover = _;
-            drawHover(surface, graph, extent, zoom);
-        }
-    };
-
-    return drawVertices;
-};
 iD.svg.Areas = function(projection) {
     // Patterns only work in Firefox when set directly on element.
     // (This is not a bug: https://bugzilla.mozilla.org/show_bug.cgi?id=750632)
@@ -31512,6 +31325,193 @@ iD.svg.Icon = function(name, svgklass, useklass) {
             .attr('class', useklass);
     };
 };
+iD.svg.Vertices = function(projection, context) {
+    var radiuses = {
+        //       z16-, z17, z18+, tagged
+        shadow: [6,    7.5,   7.5,  11.5],
+        stroke: [2.5,  3.5,   3.5,  7],
+        fill:   [1,    1.5,   1.5,  1.5]
+    };
+
+    var hover;
+
+    function siblingAndChildVertices(ids, graph, extent) {
+        var vertices = {};
+
+        function addChildVertices(entity) {
+            if (!context.features().isHiddenFeature(entity, graph, entity.geometry(graph))) {
+                var i;
+                if (entity.type === 'way') {
+                    for (i = 0; i < entity.nodes.length; i++) {
+                        addChildVertices(graph.entity(entity.nodes[i]));
+                    }
+                } else if (entity.type === 'relation') {
+                    for (i = 0; i < entity.members.length; i++) {
+                        var member = context.hasEntity(entity.members[i].id);
+                        if (member) {
+                            addChildVertices(member);
+                        }
+                    }
+                } else if (entity.intersects(extent, graph)) {
+                    vertices[entity.id] = entity;
+                }
+            }
+        }
+
+        ids.forEach(function(id) {
+            var entity = context.hasEntity(id);
+            if (entity && entity.type === 'node') {
+                vertices[entity.id] = entity;
+                context.graph().parentWays(entity).forEach(function(entity) {
+                    addChildVertices(entity);
+                });
+            } else if (entity) {
+                addChildVertices(entity);
+            }
+        });
+
+        return vertices;
+    }
+
+    function draw(selection, vertices, klass, graph, zoom) {
+        var icons = {},
+            z;
+
+        if (zoom < 17) {
+            z = 0;
+        } else if (zoom < 18) {
+            z = 1;
+        } else {
+            z = 2;
+        }
+
+        var groups = selection.data(vertices, function(entity) {
+            return iD.Entity.key(entity);
+        });
+
+        function icon(entity) {
+            if (entity.id in icons) return icons[entity.id];
+            icons[entity.id] =
+                entity.hasInterestingTags() &&
+                context.presets().match(entity, graph).icon;
+            return icons[entity.id];
+        }
+
+        function setClass(klass) {
+            return function(entity) {
+                this.setAttribute('class', 'node vertex ' + klass + ' ' + entity.id);
+            };
+        }
+
+        function setAttributes(selection) {
+            ['shadow','stroke','fill'].forEach(function(klass) {
+                var rads = radiuses[klass];
+                selection.selectAll('.' + klass)
+                    .each(function(entity) {
+                        var i = z && icon(entity),
+                            c = i ? 0.5 : 0,
+                            r = rads[i ? 3 : z];
+                        this.setAttribute('cx', c);
+                        this.setAttribute('cy', -c);
+                        this.setAttribute('r', r);
+                        if (i && klass === 'fill') {
+                            this.setAttribute('visibility', 'hidden');
+                        } else {
+                            this.removeAttribute('visibility');
+                        }
+                    });
+            });
+
+            selection.selectAll('use')
+                .each(function() {
+                    if (z) {
+                        this.removeAttribute('visibility');
+                    } else {
+                        this.setAttribute('visibility', 'hidden');
+                    }
+                });
+        }
+
+        var enter = groups.enter()
+            .append('g')
+            .attr('class', function(d) { return 'node vertex ' + klass + ' ' + d.id; });
+
+        enter.append('circle')
+            .each(setClass('shadow'));
+
+        enter.append('circle')
+            .each(setClass('stroke'));
+
+        // Vertices with icons get a `use`.
+        enter.filter(function(d) { return icon(d); })
+            .append('use')
+            .attr('transform', 'translate(-6, -6)')
+            .attr('xlink:href', function(d) { return '#' + icon(d) + '-12'; })
+            .attr('width', '12px')
+            .attr('height', '12px')
+            .each(setClass('icon'));
+
+        // Vertices with tags get a fill.
+        enter.filter(function(d) { return d.hasInterestingTags(); })
+            .append('circle')
+            .each(setClass('fill'));
+
+        groups
+            .attr('transform', iD.svg.PointTransform(projection))
+            .classed('shared', function(entity) { return graph.isShared(entity); })
+            .call(setAttributes);
+
+        groups.exit()
+            .remove();
+    }
+
+    function drawVertices(surface, graph, entities, filter, extent, zoom) {
+        var selected = siblingAndChildVertices(context.selectedIDs(), graph, extent),
+            wireframe = surface.classed('fill-wireframe'),
+            vertices = [];
+
+        for (var i = 0; i < entities.length; i++) {
+            var entity = entities[i],
+                geometry = entity.geometry(graph);
+
+            if (wireframe && geometry === 'point') {
+                vertices.push(entity);
+                continue;
+            }
+
+            if (geometry !== 'vertex')
+                continue;
+
+            if (entity.id in selected ||
+                entity.hasInterestingTags() ||
+                entity.isIntersection(graph)) {
+                vertices.push(entity);
+            }
+        }
+
+        surface.select('.layer-hit').selectAll('g.vertex.vertex-persistent')
+            .filter(filter)
+            .call(draw, vertices, 'vertex-persistent', graph, zoom);
+
+        drawHover(surface, graph, extent, zoom);
+    }
+
+    function drawHover(surface, graph, extent, zoom) {
+        var hovered = hover ? siblingAndChildVertices([hover.id], graph, extent) : {};
+
+        surface.select('.layer-hit').selectAll('g.vertex.vertex-hover')
+            .call(draw, d3.values(hovered), 'vertex-hover', graph, zoom);
+    }
+
+    drawVertices.drawHover = function(surface, graph, _, extent, zoom) {
+        if (hover !== _) {
+            hover = _;
+            drawHover(surface, graph, extent, zoom);
+        }
+    };
+
+    return drawVertices;
+};
 iD.svg.Turns = function(projection) {
     return function(surface, graph, turns) {
         function key(turn) {
@@ -32215,144 +32215,194 @@ iD.ui.RawTagEditor = function(context) {
 
     return d3.rebind(rawTagEditor, event, 'on');
 };
-iD.ui.Zoom = function(context) {
-    var zooms = [{
-        id: 'zoom-in',
-        icon: 'plus',
-        title: t('zoom.in'),
-        action: context.zoomIn,
-        key: '+'
-    }, {
-        id: 'zoom-out',
-        icon: 'minus',
-        title: t('zoom.out'),
-        action: context.zoomOut,
-        key: '-'
-    }];
+iD.ui.intro = function(context) {
+    var step;
 
-    function zoomIn() {
-        d3.event.preventDefault();
-        if (!context.inIntro()) context.zoomIn();
-    }
+    function intro(selection) {
 
-    function zoomOut() {
-        d3.event.preventDefault();
-        if (!context.inIntro()) context.zoomOut();
-    }
+        function localizedName(id) {
+            var features = {
+                n2140018997: 'city_hall',
+                n367813436: 'fire_department',
+                w203988286: 'memory_isle_park',
+                w203972937: 'riverwalk_trail',
+                w203972938: 'riverwalk_trail',
+                w203972940: 'riverwalk_trail',
+                w41785752: 'w_michigan_ave',
+                w134150789: 'w_michigan_ave',
+                w134150795: 'w_michigan_ave',
+                w134150800: 'w_michigan_ave',
+                w134150811: 'w_michigan_ave',
+                w134150802: 'e_michigan_ave',
+                w134150836: 'e_michigan_ave',
+                w41074896: 'e_michigan_ave',
+                w17965834: 'spring_st',
+                w203986457: 'scidmore_park',
+                w203049587: 'petting_zoo',
+                w17967397: 'n_andrews_st',
+                w17967315: 's_andrews_st',
+                w17967326: 'n_constantine_st',
+                w17966400: 's_constantine_st',
+                w170848823: 'rocky_river',
+                w170848824: 'rocky_river',
+                w170848331: 'rocky_river',
+                w17967752: 'railroad_dr',
+                w17965998: 'conrail_rr',
+                w134150845: 'conrail_rr',
+                w170989131: 'st_joseph_river',
+                w143497377: 'n_main_st',
+                w134150801: 's_main_st',
+                w134150830: 's_main_st',
+                w17966462: 's_main_st',
+                w17967734: 'water_st',
+                w17964996: 'foster_st',
+                w170848330: 'portage_river',
+                w17965351: 'flower_st',
+                w17965502: 'elm_st',
+                w17965402: 'walnut_st',
+                w17964793: 'morris_ave',
+                w17967444: 'east_st',
+                w17966984: 'portage_ave'
+            };
+            return features[id] && t('intro.graph.' + features[id]);
+        }
 
-    function zoomInFurther() {
-        d3.event.preventDefault();
-        if (!context.inIntro()) context.zoomInFurther();
-    }
+        context.enter(iD.modes.Browse(context));
 
-    function zoomOutFurther() {
-        d3.event.preventDefault();
-        if (!context.inIntro()) context.zoomOutFurther();
-    }
+        // Save current map state
+        var history = context.history().toJSON(),
+            hash = window.location.hash,
+            center = context.map().center(),
+            zoom = context.map().zoom(),
+            background = context.background().baseLayerSource(),
+            opacity = d3.select('.background-layer').style('opacity'),
+            loadedTiles = context.connection().loadedTiles(),
+            baseEntities = context.history().graph().base().entities,
+            introGraph, name;
 
+        // Block saving
+        context.inIntro(true);
 
-    return function(selection) {
-        var button = selection.selectAll('button')
-            .data(zooms)
-            .enter().append('button')
-            .attr('tabindex', -1)
-            .attr('class', function(d) { return d.id; })
-            .on('click.editor', function(d) { d.action(); })
-            .call(bootstrap.tooltip()
-                .placement('left')
-                .html(true)
-                .title(function(d) {
-                    return iD.ui.tooltipHtml(d.title, d.key);
-                }));
+        // Load semi-real data used in intro
+        context.connection().toggle(false).flush();
+        context.history().reset();
 
-        button.each(function(d) {
-            d3.select(this)
-                .call(iD.svg.Icon('#icon-' + d.icon, 'light'));
+        introGraph = JSON.parse(iD.introGraph);
+        for (var key in introGraph) {
+            introGraph[key] = iD.Entity(introGraph[key]);
+            name = localizedName(key);
+            if (name) {
+                introGraph[key].tags.name = name;
+            }
+        }
+        context.history().merge(d3.values(iD.Graph().load(introGraph).entities));
+        context.background().bing();
+
+        d3.select('.background-layer').style('opacity', 1);
+
+        var curtain = d3.curtain();
+        selection.call(curtain);
+
+        function reveal(box, text, options) {
+            options = options || {};
+            if (text) curtain.reveal(box, text, options.tooltipClass, options.duration);
+            else curtain.reveal(box, '', '', options.duration);
+        }
+
+        var steps = ['navigation', 'point', 'area', 'line', 'startEditing'].map(function(step, i) {
+            var s = iD.ui.intro[step](context, reveal)
+                .on('done', function() {
+                    entered.filter(function(d) {
+                        return d.title === s.title;
+                    }).classed('finished', true);
+                    enter(steps[i + 1]);
+                });
+            return s;
         });
 
-        var keybinding = d3.keybinding('zoom');
-
-        _.each(['=','ffequals','plus','ffplus'], function(key) {
-            keybinding.on(key, zoomIn);
-            keybinding.on('⇧' + key, zoomIn);
-            keybinding.on(iD.ui.cmd('⌘' + key), zoomInFurther);
-            keybinding.on(iD.ui.cmd('⌘⇧' + key), zoomInFurther);
-        });
-        _.each(['-','ffminus','_','dash'], function(key) {
-            keybinding.on(key, zoomOut);
-            keybinding.on('⇧' + key, zoomOut);
-            keybinding.on(iD.ui.cmd('⌘' + key), zoomOutFurther);
-            keybinding.on(iD.ui.cmd('⌘⇧' + key), zoomOutFurther);
+        steps[steps.length - 1].on('startEditing', function() {
+            curtain.remove();
+            navwrap.remove();
+            d3.select('.background-layer').style('opacity', opacity);
+            context.connection().toggle(true).flush().loadedTiles(loadedTiles);
+            context.history().reset().merge(d3.values(baseEntities));
+            context.background().baseLayerSource(background);
+            if (history) context.history().fromJSON(history, false);
+            context.map().centerZoom(center, zoom);
+            window.location.replace(hash);
+            context.inIntro(false);
         });
 
-        d3.select(document)
-            .call(keybinding);
+        var navwrap = selection.append('div').attr('class', 'intro-nav-wrap fillD');
+
+        var buttonwrap = navwrap.append('div')
+            .attr('class', 'joined')
+            .selectAll('button.step');
+
+        var entered = buttonwrap
+            .data(steps)
+            .enter()
+            .append('button')
+            .attr('class', 'step')
+            .on('click', enter);
+
+        entered
+            .call(iD.svg.Icon('#icon-apply', 'pre-text'));
+
+        entered
+            .append('label')
+            .text(function(d) { return t(d.title); });
+
+        enter(steps[0]);
+
+        function enter (newStep) {
+            if (step) { step.exit(); }
+
+            context.enter(iD.modes.Browse(context));
+
+            step = newStep;
+            step.enter();
+
+            entered.classed('active', function(d) {
+                return d.title === step.title;
+            });
+        }
+
+    }
+    return intro;
+};
+
+iD.ui.intro.pointBox = function(point, context) {
+    var rect = context.surfaceRect();
+    point = context.projection(point);
+    return {
+        left: point[0] + rect.left - 30,
+        top: point[1] + rect.top - 50,
+        width: 60,
+        height: 70
     };
 };
-iD.ui.Contributors = function(context) {
-    function update(selection) {
-        var users = {},
-            limit = 4,
-            entities = context.intersects(context.map().extent());
 
-        entities.forEach(function(entity) {
-            if (entity && entity.user) users[entity.user] = true;
-        });
-
-        var u = Object.keys(users),
-            subset = u.slice(0, u.length > limit ? limit - 1 : limit);
-
-        selection.html('')
-            .call(iD.svg.Icon('#icon-nearby', 'pre-text light'));
-
-        var userList = d3.select(document.createElement('span'));
-
-        userList.selectAll()
-            .data(subset)
-            .enter()
-            .append('a')
-            .attr('class', 'user-link')
-            .attr('href', function(d) { return context.connection().userURL(d); })
-            .attr('target', '_blank')
-            .attr('tabindex', -1)
-            .text(String);
-
-        if (u.length > limit) {
-            var count = d3.select(document.createElement('span'));
-
-            count.append('a')
-                .attr('target', '_blank')
-                .attr('tabindex', -1)
-                .attr('href', function() {
-                    return context.connection().changesetsURL(context.map().center(), context.map().zoom());
-                })
-                .text(u.length - limit + 1);
-
-            selection.append('span')
-                .html(t('contributors.truncated_list', {users: userList.html(), count: count.html()}));
-        } else {
-            selection.append('span')
-                .html(t('contributors.list', {users: userList.html()}));
-        }
-
-        if (!u.length) {
-            selection.transition().style('opacity', 0);
-        } else if (selection.style('opacity') === '0') {
-            selection.transition().style('opacity', 1);
-        }
+iD.ui.intro.pad = function(box, padding, context) {
+    if (box instanceof Array) {
+        var rect = context.surfaceRect();
+        box = context.projection(box);
+        box = {
+            left: box[0] + rect.left,
+            top: box[1] + rect.top
+        };
     }
-
-    return function(selection) {
-        update(selection);
-
-        context.connection().on('loaded.contributors', function() {
-            update(selection);
-        });
-
-        context.map().on('move.contributors', _.debounce(function() {
-            update(selection);
-        }, 500));
+    return {
+        left: box.left - padding,
+        top: box.top - padding,
+        width: (box.width || 0) + 2 * padding,
+        height: (box.width || 0) + 2 * padding
     };
+};
+
+iD.ui.intro.icon = function(name, svgklass) {
+    return '<svg class="icon ' + (svgklass || '') + '">' +
+        '<use xlink:href="' + name + '"></use></svg>';
 };
 iD.ui.Geolocate = function(map) {
     function click() {
@@ -32972,138 +33022,261 @@ iD.ui.Background = function(context) {
 
     return background;
 };
-iD.ui.RadialMenu = function(context, operations) {
-    var menu,
-        center = [0, 0],
-        tooltip;
+iD.ui.FeatureList = function(context) {
+    var geocodeResults;
 
-    var radialMenu = function(selection) {
-        if (!operations.length)
-            return;
+    function featureList(selection) {
+        var header = selection.append('div')
+            .attr('class', 'header fillL cf');
 
-        selection.node().parentNode.focus();
+        header.append('h3')
+            .text(t('inspector.feature_list'));
 
-        function click(operation) {
-            d3.event.stopPropagation();
-            if (operation.disabled())
-                return;
-            operation();
-            radialMenu.close();
-        }
-
-        menu = selection.append('g')
-            .attr('class', 'radial-menu')
-            .attr('transform', 'translate(' + center + ')')
-            .attr('opacity', 0);
-
-        menu.transition()
-            .attr('opacity', 1);
-
-        var r = 50,
-            a = Math.PI / 4,
-            a0 = -Math.PI / 4,
-            a1 = a0 + (operations.length - 1) * a;
-
-        menu.append('path')
-            .attr('class', 'radial-menu-background')
-            .attr('d', 'M' + r * Math.sin(a0) + ',' +
-                             r * Math.cos(a0) +
-                      ' A' + r + ',' + r + ' 0 ' + (operations.length > 5 ? '1' : '0') + ',0 ' +
-                             (r * Math.sin(a1) + 1e-3) + ',' +
-                             (r * Math.cos(a1) + 1e-3)) // Force positive-length path (#1305)
-            .attr('stroke-width', 50)
-            .attr('stroke-linecap', 'round');
-
-        var button = menu.selectAll()
-            .data(operations)
-            .enter()
-            .append('g')
-            .attr('class', function(d) { return 'radial-menu-item radial-menu-item-' + d.id; })
-            .classed('disabled', function(d) { return d.disabled(); })
-            .attr('transform', function(d, i) {
-                return 'translate(' + iD.geo.roundCoords([
-                        r * Math.sin(a0 + i * a),
-                        r * Math.cos(a0 + i * a)]).join(',') + ')';
-            });
-
-        button.append('circle')
-            .attr('r', 15)
-            .on('click', click)
-            .on('mousedown', mousedown)
-            .on('mouseover', mouseover)
-            .on('mouseout', mouseout);
-
-        button.append('use')
-            .attr('transform', 'translate(-10,-10)')
-            .attr('width', '20')
-            .attr('height', '20')
-            .attr('xlink:href', function(d) { return '#operation-' + d.id; });
-
-        tooltip = d3.select(document.body)
-            .append('div')
-            .attr('class', 'tooltip-inner radial-menu-tooltip');
-
-        function mousedown() {
-            d3.event.stopPropagation(); // https://github.com/openstreetmap/iD/issues/1869
-        }
-
-        function mouseover(d, i) {
-            var rect = context.surfaceRect(),
-                angle = a0 + i * a,
-                top = rect.top + (r + 25) * Math.cos(angle) + center[1] + 'px',
-                left = rect.left + (r + 25) * Math.sin(angle) + center[0] + 'px',
-                bottom = rect.height - (r + 25) * Math.cos(angle) - center[1] + 'px',
-                right = rect.width - (r + 25) * Math.sin(angle) - center[0] + 'px';
-
-            tooltip
-                .style('top', null)
-                .style('left', null)
-                .style('bottom', null)
-                .style('right', null)
-                .style('display', 'block')
-                .html(iD.ui.tooltipHtml(d.tooltip(), d.keys[0]));
-
-            if (i === 0) {
-                tooltip
-                    .style('right', right)
-                    .style('top', top);
-            } else if (i >= 4) {
-                tooltip
-                    .style('left', left)
-                    .style('bottom', bottom);
-            } else {
-                tooltip
-                    .style('left', left)
-                    .style('top', top);
+        function keypress() {
+            var q = search.property('value'),
+                items = list.selectAll('.feature-list-item');
+            if (d3.event.keyCode === 13 && q.length && items.size()) {
+                click(items.datum());
             }
         }
 
-        function mouseout() {
-            tooltip.style('display', 'none');
+        function inputevent() {
+            geocodeResults = undefined;
+            drawList();
         }
-    };
 
-    radialMenu.close = function() {
-        if (menu) {
-            menu
-                .style('pointer-events', 'none')
+        var searchWrap = selection.append('div')
+            .attr('class', 'search-header');
+
+        var search = searchWrap.append('input')
+            .attr('placeholder', t('inspector.search'))
+            .attr('type', 'search')
+            .on('keypress', keypress)
+            .on('input', inputevent);
+
+        searchWrap
+            .call(iD.svg.Icon('#icon-search', 'pre-text'));
+
+        var listWrap = selection.append('div')
+            .attr('class', 'inspector-body');
+
+        var list = listWrap.append('div')
+            .attr('class', 'feature-list cf');
+
+        context
+            .on('exit.feature-list', clearSearch);
+        context.map()
+            .on('drawn.feature-list', mapDrawn);
+
+        function clearSearch() {
+            search.property('value', '');
+            drawList();
+        }
+
+        function mapDrawn(e) {
+            if (e.full) {
+                drawList();
+            }
+        }
+
+        function features() {
+            var entities = {},
+                result = [],
+                graph = context.graph(),
+                q = search.property('value').toLowerCase();
+
+            if (!q) return result;
+
+            var idMatch = q.match(/^([nwr])([0-9]+)$/);
+
+            if (idMatch) {
+                result.push({
+                    id: idMatch[0],
+                    geometry: idMatch[1] === 'n' ? 'point' : idMatch[1] === 'w' ? 'line' : 'relation',
+                    type: idMatch[1] === 'n' ? t('inspector.node') : idMatch[1] === 'w' ? t('inspector.way') : t('inspector.relation'),
+                    name: idMatch[2]
+                });
+            }
+
+            var locationMatch = sexagesimal.pair(q.toUpperCase()) || q.match(/^(-?\d+\.?\d*)\s+(-?\d+\.?\d*)$/);
+
+            if (locationMatch) {
+                var loc = [parseFloat(locationMatch[0]), parseFloat(locationMatch[1])];
+                result.push({
+                    id: -1,
+                    geometry: 'point',
+                    type: t('inspector.location'),
+                    name: loc[0].toFixed(6) + ', ' + loc[1].toFixed(6),
+                    location: loc
+                });
+            }
+
+            function addEntity(entity) {
+                if (entity.id in entities || result.length > 200)
+                    return;
+
+                entities[entity.id] = true;
+
+                var name = iD.util.displayName(entity) || '';
+                if (name.toLowerCase().indexOf(q) >= 0) {
+                    result.push({
+                        id: entity.id,
+                        entity: entity,
+                        geometry: context.geometry(entity.id),
+                        type: context.presets().match(entity, graph).name(),
+                        name: name
+                    });
+                }
+
+                graph.parentRelations(entity).forEach(function(parent) {
+                    addEntity(parent);
+                });
+            }
+
+            var visible = context.surface().selectAll('.point, .line, .area')[0];
+            for (var i = 0; i < visible.length && result.length <= 200; i++) {
+                addEntity(visible[i].__data__);
+            }
+
+            (geocodeResults || []).forEach(function(d) {
+                // https://github.com/openstreetmap/iD/issues/1890
+                if (d.osm_type && d.osm_id) {
+                    result.push({
+                        id: iD.Entity.id.fromOSM(d.osm_type, d.osm_id),
+                        geometry: d.osm_type === 'relation' ? 'relation' : d.osm_type === 'way' ? 'line' : 'point',
+                        type: d.type !== 'yes' ? (d.type.charAt(0).toUpperCase() + d.type.slice(1)).replace('_', ' ')
+                                               : (d.class.charAt(0).toUpperCase() + d.class.slice(1)).replace('_', ' '),
+                        name: d.display_name,
+                        extent: new iD.geo.Extent(
+                            [parseFloat(d.boundingbox[3]), parseFloat(d.boundingbox[0])],
+                            [parseFloat(d.boundingbox[2]), parseFloat(d.boundingbox[1])])
+                    });
+                }
+            });
+
+            return result;
+        }
+
+        function drawList() {
+            var value = search.property('value'),
+                results = features();
+
+            list.classed('filtered', value.length);
+
+            var noResultsWorldwide = geocodeResults && geocodeResults.length === 0;
+
+            var resultsIndicator = list.selectAll('.no-results-item')
+                .data([0])
+                .enter().append('button')
+                .property('disabled', true)
+                .attr('class', 'no-results-item')
+                .call(iD.svg.Icon('#icon-alert', 'pre-text'));
+
+            resultsIndicator.append('span')
+                .attr('class', 'entity-name');
+
+            list.selectAll('.no-results-item .entity-name')
+                .text(noResultsWorldwide ? t('geocoder.no_results_worldwide') : t('geocoder.no_results_visible'));
+
+            list.selectAll('.geocode-item')
+                .data([0])
+                .enter().append('button')
+                .attr('class', 'geocode-item')
+                .on('click', geocode)
+                .append('div')
+                .attr('class', 'label')
+                .append('span')
+                .attr('class', 'entity-name')
+                .text(t('geocoder.search'));
+
+            list.selectAll('.no-results-item')
+                .style('display', (value.length && !results.length) ? 'block' : 'none');
+
+            list.selectAll('.geocode-item')
+                .style('display', (value && geocodeResults === undefined) ? 'block' : 'none');
+
+            list.selectAll('.feature-list-item')
+                .data([-1])
+                .remove();
+
+            var items = list.selectAll('.feature-list-item')
+                .data(results, function(d) { return d.id; });
+
+            var enter = items.enter()
+                .insert('button', '.geocode-item')
+                .attr('class', 'feature-list-item')
+                .on('mouseover', mouseover)
+                .on('mouseout', mouseout)
+                .on('click', click);
+
+            var label = enter
+                .append('div')
+                .attr('class', 'label');
+
+            label.each(function(d) {
+                d3.select(this)
+                    .call(iD.svg.Icon('#icon-' + d.geometry, 'pre-text'));
+            });
+
+            label.append('span')
+                .attr('class', 'entity-type')
+                .text(function(d) { return d.type; });
+
+            label.append('span')
+                .attr('class', 'entity-name')
+                .text(function(d) { return d.name; });
+
+            enter.style('opacity', 0)
                 .transition()
-                .attr('opacity', 0)
+                .style('opacity', 1);
+
+            items.order();
+
+            items.exit()
                 .remove();
         }
 
-        if (tooltip) {
-            tooltip.remove();
+        function mouseover(d) {
+            if (d.id === -1) return;
+
+            context.surface().selectAll(iD.util.entityOrMemberSelector([d.id], context.graph()))
+                .classed('hover', true);
         }
-    };
 
-    radialMenu.center = function(_) {
-        if (!arguments.length) return center;
-        center = _;
-        return radialMenu;
-    };
+        function mouseout() {
+            context.surface().selectAll('.hover')
+                .classed('hover', false);
+        }
 
-    return radialMenu;
+        function click(d) {
+            d3.event.preventDefault();
+            if (d.location) {
+                context.map().centerZoom([d.location[1], d.location[0]], 20);
+            }
+            else if (d.entity) {
+                if (d.entity.type === 'node') {
+                    context.map().center(d.entity.loc);
+                } else if (d.entity.type === 'way') {
+                    var center = context.projection(context.map().center()),
+                        edge = iD.geo.chooseEdge(context.childNodes(d.entity), center, context.projection);
+                    context.map().center(edge.loc);
+                }
+                context.enter(iD.modes.Select(context, [d.entity.id]).suppressMenu(true));
+            } else {
+                context.zoomToEntity(d.id);
+            }
+        }
+
+        function geocode() {
+            var searchVal = encodeURIComponent(search.property('value'));
+            d3.json('https://nominatim.openstreetmap.org/search/' + searchVal + '?limit=10&format=json', function(err, resp) {
+                geocodeResults = resp || [];
+                drawList();
+            });
+        }
+    }
+
+    return featureList;
 };
 iD.ui.confirm = function(selection) {
     var modal = iD.ui.modal(selection);
@@ -33374,75 +33547,79 @@ iD.ui.PresetIcon = function() {
 
     return presetIcon;
 };
-iD.ui.SelectionList = function(context, selectedIDs) {
+iD.ui.Zoom = function(context) {
+    var zooms = [{
+        id: 'zoom-in',
+        icon: 'plus',
+        title: t('zoom.in'),
+        action: context.zoomIn,
+        key: '+'
+    }, {
+        id: 'zoom-out',
+        icon: 'minus',
+        title: t('zoom.out'),
+        action: context.zoomOut,
+        key: '-'
+    }];
 
-    function selectEntity(entity) {
-        context.enter(iD.modes.Select(context, [entity.id]).suppressMenu(true));
+    function zoomIn() {
+        d3.event.preventDefault();
+        if (!context.inIntro()) context.zoomIn();
+    }
+
+    function zoomOut() {
+        d3.event.preventDefault();
+        if (!context.inIntro()) context.zoomOut();
+    }
+
+    function zoomInFurther() {
+        d3.event.preventDefault();
+        if (!context.inIntro()) context.zoomInFurther();
+    }
+
+    function zoomOutFurther() {
+        d3.event.preventDefault();
+        if (!context.inIntro()) context.zoomOutFurther();
     }
 
 
-    function selectionList(selection) {
-        selection.classed('selection-list-pane', true);
+    return function(selection) {
+        var button = selection.selectAll('button')
+            .data(zooms)
+            .enter().append('button')
+            .attr('tabindex', -1)
+            .attr('class', function(d) { return d.id; })
+            .on('click.editor', function(d) { d.action(); })
+            .call(bootstrap.tooltip()
+                .placement('left')
+                .html(true)
+                .title(function(d) {
+                    return iD.ui.tooltipHtml(d.title, d.key);
+                }));
 
-        var header = selection.append('div')
-            .attr('class', 'header fillL cf');
+        button.each(function(d) {
+            d3.select(this)
+                .call(iD.svg.Icon('#icon-' + d.icon, 'light'));
+        });
 
-        header.append('h3')
-            .text(t('inspector.multiselect'));
+        var keybinding = d3.keybinding('zoom');
 
-        var listWrap = selection.append('div')
-            .attr('class', 'inspector-body');
+        _.each(['=','ffequals','plus','ffplus'], function(key) {
+            keybinding.on(key, zoomIn);
+            keybinding.on('⇧' + key, zoomIn);
+            keybinding.on(iD.ui.cmd('⌘' + key), zoomInFurther);
+            keybinding.on(iD.ui.cmd('⌘⇧' + key), zoomInFurther);
+        });
+        _.each(['-','ffminus','_','dash'], function(key) {
+            keybinding.on(key, zoomOut);
+            keybinding.on('⇧' + key, zoomOut);
+            keybinding.on(iD.ui.cmd('⌘' + key), zoomOutFurther);
+            keybinding.on(iD.ui.cmd('⌘⇧' + key), zoomOutFurther);
+        });
 
-        var list = listWrap.append('div')
-            .attr('class', 'feature-list cf');
-
-        context.history().on('change.selection-list', drawList);
-        drawList();
-
-        function drawList() {
-            var entities = selectedIDs
-                .map(function(id) { return context.hasEntity(id); })
-                .filter(function(entity) { return entity; });
-
-            var items = list.selectAll('.feature-list-item')
-                .data(entities, iD.Entity.key);
-
-            var enter = items.enter().append('button')
-                .attr('class', 'feature-list-item')
-                .on('click', selectEntity);
-
-            // Enter
-            var label = enter.append('div')
-                .attr('class', 'label')
-                .call(iD.svg.Icon('', 'pre-text'));
-
-            label.append('span')
-                .attr('class', 'entity-type');
-
-            label.append('span')
-                .attr('class', 'entity-name');
-
-            // Update
-            items.selectAll('use')
-                .attr('href', function() {
-                    var entity = this.parentNode.parentNode.__data__;
-                    return '#icon-' + context.geometry(entity.id);
-                });
-
-            items.selectAll('.entity-type')
-                .text(function(entity) { return context.presets().match(entity, context.graph()).name(); });
-
-            items.selectAll('.entity-name')
-                .text(function(entity) { return iD.util.displayName(entity); });
-
-            // Exit
-            items.exit()
-                .remove();
-        }
-    }
-
-    return selectionList;
-
+        d3.select(document)
+            .call(keybinding);
+    };
 };
 iD.ui.ViewOnOSM = function(context) {
     var id;
@@ -33474,72 +33651,6 @@ iD.ui.ViewOnOSM = function(context) {
     };
 
     return viewOnOSM;
-};
-iD.ui.Account = function(context) {
-    var connection = context.connection();
-
-    function update(selection) {
-        if (!connection.authenticated()) {
-            selection.selectAll('#userLink, #logoutLink')
-                .classed('hide', true);
-            return;
-        }
-
-        connection.userDetails(function(err, details) {
-            var userLink = selection.select('#userLink'),
-                logoutLink = selection.select('#logoutLink');
-
-            userLink.html('');
-            logoutLink.html('');
-
-            if (err) return;
-
-            selection.selectAll('#userLink, #logoutLink')
-                .classed('hide', false);
-
-            // Link
-            userLink.append('a')
-                .attr('href', connection.userURL(details.display_name))
-                .attr('target', '_blank');
-
-            // Add thumbnail or dont
-            if (details.image_url) {
-                userLink.append('img')
-                    .attr('class', 'icon pre-text user-icon')
-                    .attr('src', details.image_url);
-            } else {
-                userLink
-                    .call(iD.svg.Icon('#icon-avatar', 'pre-text light'));
-            }
-
-            // Add user name
-            userLink.append('span')
-                .attr('class', 'label')
-                .text(details.display_name);
-
-            logoutLink.append('a')
-                .attr('class', 'logout')
-                .attr('href', '#')
-                .text(t('logout'))
-                .on('click.logout', function() {
-                    d3.event.preventDefault();
-                    connection.logout();
-                });
-        });
-    }
-
-    return function(selection) {
-        selection.append('li')
-            .attr('id', 'logoutLink')
-            .classed('hide', true);
-
-        selection.append('li')
-            .attr('id', 'userLink')
-            .classed('hide', true);
-
-        connection.on('auth.account', function() { update(selection); });
-        update(selection);
-    };
 };
 iD.ui.FeatureInfo = function(context) {
     function update(selection) {
@@ -34212,286 +34323,24 @@ iD.ui.Commit = function(context) {
 
     return d3.rebind(commit, dispatch, 'on');
 };
-iD.ui.FeatureList = function(context) {
-    var geocodeResults;
+iD.ui.flash = function(selection) {
+    var modal = iD.ui.modal(selection);
 
-    function featureList(selection) {
-        var header = selection.append('div')
-            .attr('class', 'header fillL cf');
+    modal.select('.modal').classed('modal-flash', true);
 
-        header.append('h3')
-            .text(t('inspector.feature_list'));
+    modal.select('.content')
+        .classed('modal-section', true)
+        .append('div')
+        .attr('class', 'description');
 
-        function keypress() {
-            var q = search.property('value'),
-                items = list.selectAll('.feature-list-item');
-            if (d3.event.keyCode === 13 && q.length && items.size()) {
-                click(items.datum());
-            }
-        }
+    modal.on('click.flash', function() { modal.remove(); });
 
-        function inputevent() {
-            geocodeResults = undefined;
-            drawList();
-        }
+    setTimeout(function() {
+        modal.remove();
+        return true;
+    }, 1500);
 
-        var searchWrap = selection.append('div')
-            .attr('class', 'search-header');
-
-        var search = searchWrap.append('input')
-            .attr('placeholder', t('inspector.search'))
-            .attr('type', 'search')
-            .on('keypress', keypress)
-            .on('input', inputevent);
-
-        searchWrap
-            .call(iD.svg.Icon('#icon-search', 'pre-text'));
-
-        var listWrap = selection.append('div')
-            .attr('class', 'inspector-body');
-
-        var list = listWrap.append('div')
-            .attr('class', 'feature-list cf');
-
-        context
-            .on('exit.feature-list', clearSearch);
-        context.map()
-            .on('drawn.feature-list', mapDrawn);
-
-        function clearSearch() {
-            search.property('value', '');
-            drawList();
-        }
-
-        function mapDrawn(e) {
-            if (e.full) {
-                drawList();
-            }
-        }
-
-        function features() {
-            var entities = {},
-                result = [],
-                graph = context.graph(),
-                q = search.property('value').toLowerCase();
-
-            if (!q) return result;
-
-            var idMatch = q.match(/^([nwr])([0-9]+)$/);
-
-            if (idMatch) {
-                result.push({
-                    id: idMatch[0],
-                    geometry: idMatch[1] === 'n' ? 'point' : idMatch[1] === 'w' ? 'line' : 'relation',
-                    type: idMatch[1] === 'n' ? t('inspector.node') : idMatch[1] === 'w' ? t('inspector.way') : t('inspector.relation'),
-                    name: idMatch[2]
-                });
-            }
-
-            var locationMatch = sexagesimal.pair(q.toUpperCase()) || q.match(/^(-?\d+\.?\d*)\s+(-?\d+\.?\d*)$/);
-
-            if (locationMatch) {
-                var loc = [parseFloat(locationMatch[0]), parseFloat(locationMatch[1])];
-                result.push({
-                    id: -1,
-                    geometry: 'point',
-                    type: t('inspector.location'),
-                    name: loc[0].toFixed(6) + ', ' + loc[1].toFixed(6),
-                    location: loc
-                });
-            }
-
-            function addEntity(entity) {
-                if (entity.id in entities || result.length > 200)
-                    return;
-
-                entities[entity.id] = true;
-
-                var name = iD.util.displayName(entity) || '';
-                if (name.toLowerCase().indexOf(q) >= 0) {
-                    result.push({
-                        id: entity.id,
-                        entity: entity,
-                        geometry: context.geometry(entity.id),
-                        type: context.presets().match(entity, graph).name(),
-                        name: name
-                    });
-                }
-
-                graph.parentRelations(entity).forEach(function(parent) {
-                    addEntity(parent);
-                });
-            }
-
-            var visible = context.surface().selectAll('.point, .line, .area')[0];
-            for (var i = 0; i < visible.length && result.length <= 200; i++) {
-                addEntity(visible[i].__data__);
-            }
-
-            (geocodeResults || []).forEach(function(d) {
-                // https://github.com/openstreetmap/iD/issues/1890
-                if (d.osm_type && d.osm_id) {
-                    result.push({
-                        id: iD.Entity.id.fromOSM(d.osm_type, d.osm_id),
-                        geometry: d.osm_type === 'relation' ? 'relation' : d.osm_type === 'way' ? 'line' : 'point',
-                        type: d.type !== 'yes' ? (d.type.charAt(0).toUpperCase() + d.type.slice(1)).replace('_', ' ')
-                                               : (d.class.charAt(0).toUpperCase() + d.class.slice(1)).replace('_', ' '),
-                        name: d.display_name,
-                        extent: new iD.geo.Extent(
-                            [parseFloat(d.boundingbox[3]), parseFloat(d.boundingbox[0])],
-                            [parseFloat(d.boundingbox[2]), parseFloat(d.boundingbox[1])])
-                    });
-                }
-            });
-
-            return result;
-        }
-
-        function drawList() {
-            var value = search.property('value'),
-                results = features();
-
-            list.classed('filtered', value.length);
-
-            var noResultsWorldwide = geocodeResults && geocodeResults.length === 0;
-
-            var resultsIndicator = list.selectAll('.no-results-item')
-                .data([0])
-                .enter().append('button')
-                .property('disabled', true)
-                .attr('class', 'no-results-item')
-                .call(iD.svg.Icon('#icon-alert', 'pre-text'));
-
-            resultsIndicator.append('span')
-                .attr('class', 'entity-name');
-
-            list.selectAll('.no-results-item .entity-name')
-                .text(noResultsWorldwide ? t('geocoder.no_results_worldwide') : t('geocoder.no_results_visible'));
-
-            list.selectAll('.geocode-item')
-                .data([0])
-                .enter().append('button')
-                .attr('class', 'geocode-item')
-                .on('click', geocode)
-                .append('div')
-                .attr('class', 'label')
-                .append('span')
-                .attr('class', 'entity-name')
-                .text(t('geocoder.search'));
-
-            list.selectAll('.no-results-item')
-                .style('display', (value.length && !results.length) ? 'block' : 'none');
-
-            list.selectAll('.geocode-item')
-                .style('display', (value && geocodeResults === undefined) ? 'block' : 'none');
-
-            list.selectAll('.feature-list-item')
-                .data([-1])
-                .remove();
-
-            var items = list.selectAll('.feature-list-item')
-                .data(results, function(d) { return d.id; });
-
-            var enter = items.enter()
-                .insert('button', '.geocode-item')
-                .attr('class', 'feature-list-item')
-                .on('mouseover', mouseover)
-                .on('mouseout', mouseout)
-                .on('click', click);
-
-            var label = enter
-                .append('div')
-                .attr('class', 'label');
-
-            label.each(function(d) {
-                d3.select(this)
-                    .call(iD.svg.Icon('#icon-' + d.geometry, 'pre-text'));
-            });
-
-            label.append('span')
-                .attr('class', 'entity-type')
-                .text(function(d) { return d.type; });
-
-            label.append('span')
-                .attr('class', 'entity-name')
-                .text(function(d) { return d.name; });
-
-            enter.style('opacity', 0)
-                .transition()
-                .style('opacity', 1);
-
-            items.order();
-
-            items.exit()
-                .remove();
-        }
-
-        function mouseover(d) {
-            if (d.id === -1) return;
-
-            context.surface().selectAll(iD.util.entityOrMemberSelector([d.id], context.graph()))
-                .classed('hover', true);
-        }
-
-        function mouseout() {
-            context.surface().selectAll('.hover')
-                .classed('hover', false);
-        }
-
-        function click(d) {
-            d3.event.preventDefault();
-            if (d.location) {
-                context.map().centerZoom([d.location[1], d.location[0]], 20);
-            }
-            else if (d.entity) {
-                if (d.entity.type === 'node') {
-                    context.map().center(d.entity.loc);
-                } else if (d.entity.type === 'way') {
-                    var center = context.projection(context.map().center()),
-                        edge = iD.geo.chooseEdge(context.childNodes(d.entity), center, context.projection);
-                    context.map().center(edge.loc);
-                }
-                context.enter(iD.modes.Select(context, [d.entity.id]).suppressMenu(true));
-            } else {
-                context.zoomToEntity(d.id);
-            }
-        }
-
-        function geocode() {
-            var searchVal = encodeURIComponent(search.property('value'));
-            d3.json('https://nominatim.openstreetmap.org/search/' + searchVal + '?limit=10&format=json', function(err, resp) {
-                geocodeResults = resp || [];
-                drawList();
-            });
-        }
-    }
-
-    return featureList;
-};
-iD.ui.Notice = function(context) {
-    return function(selection) {
-        var div = selection.append('div')
-            .attr('class', 'notice');
-
-        var button = div.append('button')
-            .attr('class', 'zoom-to notice')
-            .on('click', function() { context.map().zoom(context.minEditableZoom()); });
-
-        button
-            .call(iD.svg.Icon('#icon-plus', 'pre-text'))
-            .append('span')
-            .attr('class', 'label')
-            .text(t('zoom_in_edit'));
-
-        function disableTooHigh() {
-            div.style('display', context.editable() ? 'none' : 'block');
-        }
-
-        context.map()
-            .on('move.notice', _.debounce(disableTooHigh, 500));
-
-        disableTooHigh();
-    };
+    return modal;
 };
 iD.ui.RawMemberEditor = function(context) {
     var id;
@@ -34610,6 +34459,76 @@ iD.ui.RawMemberEditor = function(context) {
     };
 
     return rawMemberEditor;
+};
+iD.ui.SelectionList = function(context, selectedIDs) {
+
+    function selectEntity(entity) {
+        context.enter(iD.modes.Select(context, [entity.id]).suppressMenu(true));
+    }
+
+
+    function selectionList(selection) {
+        selection.classed('selection-list-pane', true);
+
+        var header = selection.append('div')
+            .attr('class', 'header fillL cf');
+
+        header.append('h3')
+            .text(t('inspector.multiselect'));
+
+        var listWrap = selection.append('div')
+            .attr('class', 'inspector-body');
+
+        var list = listWrap.append('div')
+            .attr('class', 'feature-list cf');
+
+        context.history().on('change.selection-list', drawList);
+        drawList();
+
+        function drawList() {
+            var entities = selectedIDs
+                .map(function(id) { return context.hasEntity(id); })
+                .filter(function(entity) { return entity; });
+
+            var items = list.selectAll('.feature-list-item')
+                .data(entities, iD.Entity.key);
+
+            var enter = items.enter().append('button')
+                .attr('class', 'feature-list-item')
+                .on('click', selectEntity);
+
+            // Enter
+            var label = enter.append('div')
+                .attr('class', 'label')
+                .call(iD.svg.Icon('', 'pre-text'));
+
+            label.append('span')
+                .attr('class', 'entity-type');
+
+            label.append('span')
+                .attr('class', 'entity-name');
+
+            // Update
+            items.selectAll('use')
+                .attr('href', function() {
+                    var entity = this.parentNode.parentNode.__data__;
+                    return '#icon-' + context.geometry(entity.id);
+                });
+
+            items.selectAll('.entity-type')
+                .text(function(entity) { return context.presets().match(entity, context.graph()).name(); });
+
+            items.selectAll('.entity-name')
+                .text(function(entity) { return iD.util.displayName(entity); });
+
+            // Exit
+            items.exit()
+                .remove();
+        }
+    }
+
+    return selectionList;
+
 };
 iD.ui.RawMembershipEditor = function(context) {
     var id, showBlank;
@@ -34815,230 +34734,157 @@ iD.ui.RawMembershipEditor = function(context) {
 
     return rawMembershipEditor;
 };
-iD.ui.Info = function(context) {
-    var key = iD.ui.cmd('⌘I'),
-        imperial = (iD.detect().locale.toLowerCase() === 'en-us');
+// toggles the visibility of ui elements, using a combination of the
+// hide class, which sets display=none, and a d3 transition for opacity.
+// this will cause blinking when called repeatedly, so check that the
+// value actually changes between calls.
+iD.ui.Toggle = function(show, callback) {
+    return function(selection) {
+        selection
+            .style('opacity', show ? 0 : 1)
+            .classed('hide', false)
+            .transition()
+            .style('opacity', show ? 1 : 0)
+            .each('end', function() {
+                d3.select(this)
+                    .classed('hide', !show)
+                    .style('opacity', null);
+                if (callback) callback.apply(this);
+            });
+    };
+};
+iD.ui.RadialMenu = function(context, operations) {
+    var menu,
+        center = [0, 0],
+        tooltip;
 
-    function info(selection) {
-        function radiansToMeters(r) {
-            // using WGS84 authalic radius (6371007.1809 m)
-            return r * 6371007.1809;
-        }
+    var radialMenu = function(selection) {
+        if (!operations.length)
+            return;
 
-        function steradiansToSqmeters(r) {
-            // http://gis.stackexchange.com/a/124857/40446
-            return r / 12.56637 * 510065621724000;
-        }
+        selection.node().parentNode.focus();
 
-        function toLineString(feature) {
-            if (feature.type === 'LineString') return feature;
-
-            var result = { type: 'LineString', coordinates: [] };
-            if (feature.type === 'Polygon') {
-                result.coordinates = feature.coordinates[0];
-            } else if (feature.type === 'MultiPolygon') {
-                result.coordinates = feature.coordinates[0][0];
-            }
-
-            return result;
-        }
-
-        function displayLength(m) {
-            var d = m * (imperial ? 3.28084 : 1),
-                p, unit;
-
-            if (imperial) {
-                if (d >= 5280) {
-                    d /= 5280;
-                    unit = 'mi';
-                } else {
-                    unit = 'ft';
-                }
-            } else {
-                if (d >= 1000) {
-                    d /= 1000;
-                    unit = 'km';
-                } else {
-                    unit = 'm';
-                }
-            }
-
-            // drop unnecessary precision
-            p = d > 1000 ? 0 : d > 100 ? 1 : 2;
-
-            return String(d.toFixed(p)) + ' ' + unit;
-        }
-
-        function displayArea(m2) {
-            var d = m2 * (imperial ? 10.7639111056 : 1),
-                d1, d2, p1, p2, unit1, unit2;
-
-            if (imperial) {
-                if (d >= 6969600) {     // > 0.25mi² show mi²
-                    d1 = d / 27878400;
-                    unit1 = 'mi²';
-                } else {
-                    d1 = d;
-                    unit1 = 'ft²';
-                }
-
-                if (d > 4356 && d < 43560000) {   // 0.1 - 1000 acres
-                    d2 = d / 43560;
-                    unit2 = 'ac';
-                }
-
-            } else {
-                if (d >= 250000) {    // > 0.25km² show km²
-                    d1 = d / 1000000;
-                    unit1 = 'km²';
-                } else {
-                    d1 = d;
-                    unit1 = 'm²';
-                }
-
-                if (d > 1000 && d < 10000000) {   // 0.1 - 1000 hectares
-                    d2 = d / 10000;
-                    unit2 = 'ha';
-                }
-            }
-
-            // drop unnecessary precision
-            p1 = d1 > 1000 ? 0 : d1 > 100 ? 1 : 2;
-            p2 = d2 > 1000 ? 0 : d2 > 100 ? 1 : 2;
-
-            return String(d1.toFixed(p1)) + ' ' + unit1 +
-                (d2 ? ' (' + String(d2.toFixed(p2)) + ' ' + unit2 + ')' : '');
-        }
-
-
-        function redraw() {
-            if (hidden()) return;
-
-            var resolver = context.graph(),
-                selected = _.filter(context.selectedIDs(), function(e) { return context.hasEntity(e); }),
-                singular = selected.length === 1 ? selected[0] : null,
-                extent = iD.geo.Extent(),
-                entity;
-
-            selection.html('');
-            selection.append('h4')
-                .attr('class', 'selection-heading fillD')
-                .text(singular || t('infobox.selected', { n: selected.length }));
-
-            if (!selected.length) return;
-
-            var center;
-            for (var i = 0; i < selected.length; i++) {
-                entity = context.entity(selected[i]);
-                extent._extend(entity.extent(resolver));
-            }
-            center = extent.center();
-
-
-            var list = selection.append('ul');
-
-            // multiple selection, just display extent center..
-            if (!singular) {
-                list.append('li')
-                    .text(t('infobox.center') + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
+        function click(operation) {
+            d3.event.stopPropagation();
+            if (operation.disabled())
                 return;
-            }
+            operation();
+            radialMenu.close();
+        }
 
-            // single selection, display details..
-            if (!entity) return;
-            var geometry = entity.geometry(resolver);
+        menu = selection.append('g')
+            .attr('class', 'radial-menu')
+            .attr('transform', 'translate(' + center + ')')
+            .attr('opacity', 0);
 
-            if (geometry === 'line' || geometry === 'area') {
-                var closed = (entity.type === 'relation') || (entity.isClosed() && !entity.isDegenerate()),
-                    feature = entity.asGeoJSON(resolver),
-                    length = radiansToMeters(d3.geo.length(toLineString(feature))),
-                    lengthLabel = t('infobox.' + (closed ? 'perimeter' : 'length')),
-                    centroid = d3.geo.centroid(feature);
+        menu.transition()
+            .attr('opacity', 1);
 
-                list.append('li')
-                    .text(t('infobox.geometry') + ': ' +
-                        (closed ? t('infobox.closed') + ' ' : '') + t('geometry.' + geometry) );
+        var r = 50,
+            a = Math.PI / 4,
+            a0 = -Math.PI / 4,
+            a1 = a0 + (operations.length - 1) * a;
 
-                if (closed) {
-                    var area = steradiansToSqmeters(entity.area(resolver));
-                    list.append('li')
-                        .text(t('infobox.area') + ': ' + displayArea(area));
-                }
+        menu.append('path')
+            .attr('class', 'radial-menu-background')
+            .attr('d', 'M' + r * Math.sin(a0) + ',' +
+                             r * Math.cos(a0) +
+                      ' A' + r + ',' + r + ' 0 ' + (operations.length > 5 ? '1' : '0') + ',0 ' +
+                             (r * Math.sin(a1) + 1e-3) + ',' +
+                             (r * Math.cos(a1) + 1e-3)) // Force positive-length path (#1305)
+            .attr('stroke-width', 50)
+            .attr('stroke-linecap', 'round');
 
-                list.append('li')
-                    .text(lengthLabel + ': ' + displayLength(length));
+        var button = menu.selectAll()
+            .data(operations)
+            .enter()
+            .append('g')
+            .attr('class', function(d) { return 'radial-menu-item radial-menu-item-' + d.id; })
+            .classed('disabled', function(d) { return d.disabled(); })
+            .attr('transform', function(d, i) {
+                return 'translate(' + iD.geo.roundCoords([
+                        r * Math.sin(a0 + i * a),
+                        r * Math.cos(a0 + i * a)]).join(',') + ')';
+            });
 
-                list.append('li')
-                    .text(t('infobox.centroid') + ': ' + centroid[0].toFixed(5) + ', ' + centroid[1].toFixed(5));
+        button.append('circle')
+            .attr('r', 15)
+            .on('click', click)
+            .on('mousedown', mousedown)
+            .on('mouseover', mouseover)
+            .on('mouseout', mouseout);
 
+        button.append('use')
+            .attr('transform', 'translate(-10,-10)')
+            .attr('width', '20')
+            .attr('height', '20')
+            .attr('xlink:href', function(d) { return '#operation-' + d.id; });
 
-                var toggle  = imperial ? 'imperial' : 'metric';
-                selection.append('a')
-                    .text(t('infobox.' + toggle))
-                    .attr('href', '#')
-                    .attr('class', 'button')
-                    .on('click', function() {
-                        d3.event.preventDefault();
-                        imperial = !imperial;
-                        redraw();
-                    });
+        tooltip = d3.select(document.body)
+            .append('div')
+            .attr('class', 'tooltip-inner radial-menu-tooltip');
 
+        function mousedown() {
+            d3.event.stopPropagation(); // https://github.com/openstreetmap/iD/issues/1869
+        }
+
+        function mouseover(d, i) {
+            var rect = context.surfaceRect(),
+                angle = a0 + i * a,
+                top = rect.top + (r + 25) * Math.cos(angle) + center[1] + 'px',
+                left = rect.left + (r + 25) * Math.sin(angle) + center[0] + 'px',
+                bottom = rect.height - (r + 25) * Math.cos(angle) - center[1] + 'px',
+                right = rect.width - (r + 25) * Math.sin(angle) - center[0] + 'px';
+
+            tooltip
+                .style('top', null)
+                .style('left', null)
+                .style('bottom', null)
+                .style('right', null)
+                .style('display', 'block')
+                .html(iD.ui.tooltipHtml(d.tooltip(), d.keys[0]));
+
+            if (i === 0) {
+                tooltip
+                    .style('right', right)
+                    .style('top', top);
+            } else if (i >= 4) {
+                tooltip
+                    .style('left', left)
+                    .style('bottom', bottom);
             } else {
-                var centerLabel = t('infobox.' + (entity.type === 'node' ? 'location' : 'center'));
-
-                list.append('li')
-                    .text(t('infobox.geometry') + ': ' + t('geometry.' + geometry));
-
-                list.append('li')
-                    .text(centerLabel + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
+                tooltip
+                    .style('left', left)
+                    .style('top', top);
             }
         }
 
+        function mouseout() {
+            tooltip.style('display', 'none');
+        }
+    };
 
-        function hidden() {
-            return selection.style('display') === 'none';
+    radialMenu.close = function() {
+        if (menu) {
+            menu
+                .style('pointer-events', 'none')
+                .transition()
+                .attr('opacity', 0)
+                .remove();
         }
 
-
-        function toggle() {
-            if (d3.event) d3.event.preventDefault();
-
-            if (hidden()) {
-                selection
-                    .style('display', 'block')
-                    .style('opacity', 0)
-                    .transition()
-                    .duration(200)
-                    .style('opacity', 1);
-
-                redraw();
-
-            } else {
-                selection
-                    .style('display', 'block')
-                    .style('opacity', 1)
-                    .transition()
-                    .duration(200)
-                    .style('opacity', 0)
-                    .each('end', function() {
-                        d3.select(this).style('display', 'none');
-                    });
-            }
+        if (tooltip) {
+            tooltip.remove();
         }
+    };
 
-        context.map()
-            .on('drawn.info', redraw);
+    radialMenu.center = function(_) {
+        if (!arguments.length) return center;
+        center = _;
+        return radialMenu;
+    };
 
-        redraw();
-
-        var keybinding = d3.keybinding('info')
-            .on(key, toggle);
-
-        d3.select(document)
-            .call(keybinding);
-    }
-
-    return info;
+    return radialMenu;
 };
 iD.ui.modal = function(selection, blocking) {
 
@@ -35099,6 +34945,256 @@ iD.ui.modal = function(selection, blocking) {
     }
 
     return shaded;
+};
+iD.ui.Conflicts = function(context) {
+    var dispatch = d3.dispatch('download', 'cancel', 'save'),
+        list;
+
+    function conflicts(selection) {
+        var header = selection
+            .append('div')
+            .attr('class', 'header fillL');
+
+        header
+            .append('button')
+            .attr('class', 'fr')
+            .on('click', function() { dispatch.cancel(); })
+            .call(iD.svg.Icon('#icon-close'));
+
+        header
+            .append('h3')
+            .text(t('save.conflict.header'));
+
+        var body = selection
+            .append('div')
+            .attr('class', 'body fillL');
+
+        body
+            .append('div')
+            .attr('class', 'conflicts-help')
+            .text(t('save.conflict.help'))
+            .append('a')
+            .attr('class', 'conflicts-download')
+            .text(t('save.conflict.download_changes'))
+            .on('click.download', function() { dispatch.download(); });
+
+        body
+            .append('div')
+            .attr('class', 'conflict-container fillL3')
+            .call(showConflict, 0);
+
+        body
+            .append('div')
+            .attr('class', 'conflicts-done')
+            .attr('opacity', 0)
+            .style('display', 'none')
+            .text(t('save.conflict.done'));
+
+        var buttons = body
+            .append('div')
+            .attr('class','buttons col12 joined conflicts-buttons');
+
+        buttons
+            .append('button')
+            .attr('disabled', list.length > 1)
+            .attr('class', 'action conflicts-button col6')
+            .text(t('save.title'))
+            .on('click.try_again', function() { dispatch.save(); });
+
+        buttons
+            .append('button')
+            .attr('class', 'secondary-action conflicts-button col6')
+            .text(t('confirm.cancel'))
+            .on('click.cancel', function() { dispatch.cancel(); });
+    }
+
+
+    function showConflict(selection, index) {
+        if (index < 0 || index >= list.length) return;
+
+        var parent = d3.select(selection.node().parentNode);
+
+        // enable save button if this is the last conflict being reviewed..
+        if (index === list.length - 1) {
+            window.setTimeout(function() {
+                parent.select('.conflicts-button')
+                    .attr('disabled', null);
+
+                parent.select('.conflicts-done')
+                    .transition()
+                    .attr('opacity', 1)
+                    .style('display', 'block');
+            }, 250);
+        }
+
+        var item = selection
+            .selectAll('.conflict')
+            .data([list[index]]);
+
+        var enter = item.enter()
+            .append('div')
+            .attr('class', 'conflict');
+
+        enter
+            .append('h4')
+            .attr('class', 'conflict-count')
+            .text(t('save.conflict.count', { num: index + 1, total: list.length }));
+
+        enter
+            .append('a')
+            .attr('class', 'conflict-description')
+            .attr('href', '#')
+            .text(function(d) { return d.name; })
+            .on('click', function(d) {
+                zoomToEntity(d.id);
+                d3.event.preventDefault();
+            });
+
+        var details = enter
+            .append('div')
+            .attr('class', 'conflict-detail-container');
+
+        details
+            .append('ul')
+            .attr('class', 'conflict-detail-list')
+            .selectAll('li')
+            .data(function(d) { return d.details || []; })
+            .enter()
+            .append('li')
+            .attr('class', 'conflict-detail-item')
+            .html(function(d) { return d; });
+
+        details
+            .append('div')
+            .attr('class', 'conflict-choices')
+            .call(addChoices);
+
+        details
+            .append('div')
+            .attr('class', 'conflict-nav-buttons joined cf')
+            .selectAll('button')
+            .data(['previous', 'next'])
+            .enter()
+            .append('button')
+            .text(function(d) { return t('save.conflict.' + d); })
+            .attr('class', 'conflict-nav-button action col6')
+            .attr('disabled', function(d, i) {
+                return (i === 0 && index === 0) ||
+                    (i === 1 && index === list.length - 1) || null;
+            })
+            .on('click', function(d, i) {
+                var container = parent.select('.conflict-container'),
+                sign = (i === 0 ? -1 : 1);
+
+                container
+                    .selectAll('.conflict')
+                    .remove();
+
+                container
+                    .call(showConflict, index + sign);
+
+                d3.event.preventDefault();
+            });
+
+        item.exit()
+            .remove();
+
+    }
+
+    function addChoices(selection) {
+        var choices = selection
+            .append('ul')
+            .attr('class', 'layer-list')
+            .selectAll('li')
+            .data(function(d) { return d.choices || []; });
+
+        var enter = choices.enter()
+            .append('li')
+            .attr('class', 'layer');
+
+        var label = enter
+            .append('label');
+
+        label
+            .append('input')
+            .attr('type', 'radio')
+            .attr('name', function(d) { return d.id; })
+            .on('change', function(d, i) {
+                var ul = this.parentNode.parentNode.parentNode;
+                ul.__data__.chosen = i;
+                choose(ul, d);
+            });
+
+        label
+            .append('span')
+            .text(function(d) { return d.text; });
+
+        choices
+            .each(function(d, i) {
+                var ul = this.parentNode;
+                if (ul.__data__.chosen === i) choose(ul, d);
+            });
+    }
+
+    function choose(ul, datum) {
+        if (d3.event) d3.event.preventDefault();
+
+        d3.select(ul)
+            .selectAll('li')
+            .classed('active', function(d) { return d === datum; })
+            .selectAll('input')
+            .property('checked', function(d) { return d === datum; });
+
+        var extent = iD.geo.Extent(),
+            entity;
+
+        entity = context.graph().hasEntity(datum.id);
+        if (entity) extent._extend(entity.extent(context.graph()));
+
+        datum.action();
+
+        entity = context.graph().hasEntity(datum.id);
+        if (entity) extent._extend(entity.extent(context.graph()));
+
+        zoomToEntity(datum.id, extent);
+    }
+
+    function zoomToEntity(id, extent) {
+        context.surface().selectAll('.hover')
+            .classed('hover', false);
+
+        var entity = context.graph().hasEntity(id);
+        if (entity) {
+            if (extent) {
+                context.map().trimmedExtent(extent);
+            } else {
+                context.map().zoomTo(entity);
+            }
+            context.surface().selectAll(
+                iD.util.entityOrMemberSelector([entity.id], context.graph()))
+                .classed('hover', true);
+        }
+    }
+
+
+    // The conflict list should be an array of objects like:
+    // {
+    //     id: id,
+    //     name: entityName(local),
+    //     details: merge.conflicts(),
+    //     chosen: 1,
+    //     choices: [
+    //         choice(id, keepMine, forceLocal),
+    //         choice(id, keepTheirs, forceRemote)
+    //     ]
+    // }
+    conflicts.list = function(_) {
+        if (!arguments.length) return list;
+        list = _;
+        return conflicts;
+    };
+
+    return d3.rebind(conflicts, dispatch, 'on');
 };
 iD.ui.Lasso = function(context) {
 
@@ -35561,40 +35657,230 @@ iD.ui.MapInMap = function(context) {
 
     return map_in_map;
 };
-iD.ui.Status = function(context) {
-    var connection = context.connection(),
-        errCount = 0;
+iD.ui.Info = function(context) {
+    var key = iD.ui.cmd('⌘I'),
+        imperial = (iD.detect().locale.toLowerCase() === 'en-us');
 
-    return function(selection) {
-
-        function update() {
-
-            connection.status(function(err, apiStatus) {
-
-                selection.html('');
-
-                if (err && errCount++ < 2) return;
-
-                if (err) {
-                    selection.text(t('status.error'));
-
-                } else if (apiStatus === 'readonly') {
-                    selection.text(t('status.readonly'));
-
-                } else if (apiStatus === 'offline') {
-                    selection.text(t('status.offline'));
-                }
-
-                selection.attr('class', 'api-status ' + (err ? 'error' : apiStatus));
-                if (!err) errCount = 0;
-
-            });
+    function info(selection) {
+        function radiansToMeters(r) {
+            // using WGS84 authalic radius (6371007.1809 m)
+            return r * 6371007.1809;
         }
 
-        connection.on('auth', function() { update(selection); });
-        window.setInterval(update, 90000);
-        update(selection);
-    };
+        function steradiansToSqmeters(r) {
+            // http://gis.stackexchange.com/a/124857/40446
+            return r / 12.56637 * 510065621724000;
+        }
+
+        function toLineString(feature) {
+            if (feature.type === 'LineString') return feature;
+
+            var result = { type: 'LineString', coordinates: [] };
+            if (feature.type === 'Polygon') {
+                result.coordinates = feature.coordinates[0];
+            } else if (feature.type === 'MultiPolygon') {
+                result.coordinates = feature.coordinates[0][0];
+            }
+
+            return result;
+        }
+
+        function displayLength(m) {
+            var d = m * (imperial ? 3.28084 : 1),
+                p, unit;
+
+            if (imperial) {
+                if (d >= 5280) {
+                    d /= 5280;
+                    unit = 'mi';
+                } else {
+                    unit = 'ft';
+                }
+            } else {
+                if (d >= 1000) {
+                    d /= 1000;
+                    unit = 'km';
+                } else {
+                    unit = 'm';
+                }
+            }
+
+            // drop unnecessary precision
+            p = d > 1000 ? 0 : d > 100 ? 1 : 2;
+
+            return String(d.toFixed(p)) + ' ' + unit;
+        }
+
+        function displayArea(m2) {
+            var d = m2 * (imperial ? 10.7639111056 : 1),
+                d1, d2, p1, p2, unit1, unit2;
+
+            if (imperial) {
+                if (d >= 6969600) {     // > 0.25mi² show mi²
+                    d1 = d / 27878400;
+                    unit1 = 'mi²';
+                } else {
+                    d1 = d;
+                    unit1 = 'ft²';
+                }
+
+                if (d > 4356 && d < 43560000) {   // 0.1 - 1000 acres
+                    d2 = d / 43560;
+                    unit2 = 'ac';
+                }
+
+            } else {
+                if (d >= 250000) {    // > 0.25km² show km²
+                    d1 = d / 1000000;
+                    unit1 = 'km²';
+                } else {
+                    d1 = d;
+                    unit1 = 'm²';
+                }
+
+                if (d > 1000 && d < 10000000) {   // 0.1 - 1000 hectares
+                    d2 = d / 10000;
+                    unit2 = 'ha';
+                }
+            }
+
+            // drop unnecessary precision
+            p1 = d1 > 1000 ? 0 : d1 > 100 ? 1 : 2;
+            p2 = d2 > 1000 ? 0 : d2 > 100 ? 1 : 2;
+
+            return String(d1.toFixed(p1)) + ' ' + unit1 +
+                (d2 ? ' (' + String(d2.toFixed(p2)) + ' ' + unit2 + ')' : '');
+        }
+
+
+        function redraw() {
+            if (hidden()) return;
+
+            var resolver = context.graph(),
+                selected = _.filter(context.selectedIDs(), function(e) { return context.hasEntity(e); }),
+                singular = selected.length === 1 ? selected[0] : null,
+                extent = iD.geo.Extent(),
+                entity;
+
+            selection.html('');
+            selection.append('h4')
+                .attr('class', 'selection-heading fillD')
+                .text(singular || t('infobox.selected', { n: selected.length }));
+
+            if (!selected.length) return;
+
+            var center;
+            for (var i = 0; i < selected.length; i++) {
+                entity = context.entity(selected[i]);
+                extent._extend(entity.extent(resolver));
+            }
+            center = extent.center();
+
+
+            var list = selection.append('ul');
+
+            // multiple selection, just display extent center..
+            if (!singular) {
+                list.append('li')
+                    .text(t('infobox.center') + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
+                return;
+            }
+
+            // single selection, display details..
+            if (!entity) return;
+            var geometry = entity.geometry(resolver);
+
+            if (geometry === 'line' || geometry === 'area') {
+                var closed = (entity.type === 'relation') || (entity.isClosed() && !entity.isDegenerate()),
+                    feature = entity.asGeoJSON(resolver),
+                    length = radiansToMeters(d3.geo.length(toLineString(feature))),
+                    lengthLabel = t('infobox.' + (closed ? 'perimeter' : 'length')),
+                    centroid = d3.geo.centroid(feature);
+
+                list.append('li')
+                    .text(t('infobox.geometry') + ': ' +
+                        (closed ? t('infobox.closed') + ' ' : '') + t('geometry.' + geometry) );
+
+                if (closed) {
+                    var area = steradiansToSqmeters(entity.area(resolver));
+                    list.append('li')
+                        .text(t('infobox.area') + ': ' + displayArea(area));
+                }
+
+                list.append('li')
+                    .text(lengthLabel + ': ' + displayLength(length));
+
+                list.append('li')
+                    .text(t('infobox.centroid') + ': ' + centroid[0].toFixed(5) + ', ' + centroid[1].toFixed(5));
+
+
+                var toggle  = imperial ? 'imperial' : 'metric';
+                selection.append('a')
+                    .text(t('infobox.' + toggle))
+                    .attr('href', '#')
+                    .attr('class', 'button')
+                    .on('click', function() {
+                        d3.event.preventDefault();
+                        imperial = !imperial;
+                        redraw();
+                    });
+
+            } else {
+                var centerLabel = t('infobox.' + (entity.type === 'node' ? 'location' : 'center'));
+
+                list.append('li')
+                    .text(t('infobox.geometry') + ': ' + t('geometry.' + geometry));
+
+                list.append('li')
+                    .text(centerLabel + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
+            }
+        }
+
+
+        function hidden() {
+            return selection.style('display') === 'none';
+        }
+
+
+        function toggle() {
+            if (d3.event) d3.event.preventDefault();
+
+            if (hidden()) {
+                selection
+                    .style('display', 'block')
+                    .style('opacity', 0)
+                    .transition()
+                    .duration(200)
+                    .style('opacity', 1);
+
+                redraw();
+
+            } else {
+                selection
+                    .style('display', 'block')
+                    .style('opacity', 1)
+                    .transition()
+                    .duration(200)
+                    .style('opacity', 0)
+                    .each('end', function() {
+                        d3.select(this).style('display', 'none');
+                    });
+            }
+        }
+
+        context.map()
+            .on('drawn.info', redraw);
+
+        redraw();
+
+        var keybinding = d3.keybinding('info')
+            .on(key, toggle);
+
+        d3.select(document)
+            .call(keybinding);
+    }
+
+    return info;
 };
 iD.ui.Loading = function(context) {
     var message = '',
@@ -35794,314 +36080,313 @@ iD.ui.Save = function(context) {
         });
     };
 };
-iD.ui.SourceSwitch = function(context) {
-    var keys;
+iD.ui.PresetList = function(context) {
+    var event = d3.dispatch('choose'),
+        id,
+        currentPreset,
+        autofocus = false;
 
-    function click() {
-        d3.event.preventDefault();
+    function presetList(selection) {
+        var geometry = context.geometry(id),
+            presets = context.presets().matchGeometry(geometry);
 
-        if (context.history().hasChanges() &&
-            !window.confirm(t('source_switch.lose_changes'))) return;
+        selection.html('');
 
-        var live = d3.select(this)
-            .classed('live');
+        var messagewrap = selection.append('div')
+            .attr('class', 'header fillL cf');
 
-        context.connection()
-            .switch(live ? keys[1] : keys[0]);
+        var message = messagewrap.append('h3')
+            .text(t('inspector.choose'));
 
-        context.enter(iD.modes.Browse(context));
-        context.flush();
-
-        d3.select(this)
-            .text(live ? t('source_switch.dev') : t('source_switch.live'))
-            .classed('live', !live);
-    }
-
-    var sourceSwitch = function(selection) {
-        selection.append('a')
-            .attr('href', '#')
-            .text(t('source_switch.live'))
-            .classed('live', true)
-            .attr('tabindex', -1)
-            .on('click', click);
-    };
-
-    sourceSwitch.keys = function(_) {
-        if (!arguments.length) return keys;
-        keys = _;
-        return sourceSwitch;
-    };
-
-    return sourceSwitch;
-};
-iD.ui.Conflicts = function(context) {
-    var dispatch = d3.dispatch('download', 'cancel', 'save'),
-        list;
-
-    function conflicts(selection) {
-        var header = selection
-            .append('div')
-            .attr('class', 'header fillL');
-
-        header
-            .append('button')
-            .attr('class', 'fr')
-            .on('click', function() { dispatch.cancel(); })
-            .call(iD.svg.Icon('#icon-close'));
-
-        header
-            .append('h3')
-            .text(t('save.conflict.header'));
-
-        var body = selection
-            .append('div')
-            .attr('class', 'body fillL');
-
-        body
-            .append('div')
-            .attr('class', 'conflicts-help')
-            .text(t('save.conflict.help'))
-            .append('a')
-            .attr('class', 'conflicts-download')
-            .text(t('save.conflict.download_changes'))
-            .on('click.download', function() { dispatch.download(); });
-
-        body
-            .append('div')
-            .attr('class', 'conflict-container fillL3')
-            .call(showConflict, 0);
-
-        body
-            .append('div')
-            .attr('class', 'conflicts-done')
-            .attr('opacity', 0)
-            .style('display', 'none')
-            .text(t('save.conflict.done'));
-
-        var buttons = body
-            .append('div')
-            .attr('class','buttons col12 joined conflicts-buttons');
-
-        buttons
-            .append('button')
-            .attr('disabled', list.length > 1)
-            .attr('class', 'action conflicts-button col6')
-            .text(t('save.title'))
-            .on('click.try_again', function() { dispatch.save(); });
-
-        buttons
-            .append('button')
-            .attr('class', 'secondary-action conflicts-button col6')
-            .text(t('confirm.cancel'))
-            .on('click.cancel', function() { dispatch.cancel(); });
-    }
-
-
-    function showConflict(selection, index) {
-        if (index < 0 || index >= list.length) return;
-
-        var parent = d3.select(selection.node().parentNode);
-
-        // enable save button if this is the last conflict being reviewed..
-        if (index === list.length - 1) {
-            window.setTimeout(function() {
-                parent.select('.conflicts-button')
-                    .attr('disabled', null);
-
-                parent.select('.conflicts-done')
-                    .transition()
-                    .attr('opacity', 1)
-                    .style('display', 'block');
-            }, 250);
+        if (context.entity(id).isUsed(context.graph())) {
+            messagewrap.append('button')
+                .attr('class', 'preset-choose')
+                .on('click', function() { event.choose(currentPreset); })
+                .append('span')
+                .html('&#9658;');
+        } else {
+            messagewrap.append('button')
+                .attr('class', 'close')
+                .on('click', function() {
+                    context.enter(iD.modes.Browse(context));
+                })
+                .call(iD.svg.Icon('#icon-close'));
         }
 
-        var item = selection
-            .selectAll('.conflict')
-            .data([list[index]]);
-
-        var enter = item.enter()
-            .append('div')
-            .attr('class', 'conflict');
-
-        enter
-            .append('h4')
-            .attr('class', 'conflict-count')
-            .text(t('save.conflict.count', { num: index + 1, total: list.length }));
-
-        enter
-            .append('a')
-            .attr('class', 'conflict-description')
-            .attr('href', '#')
-            .text(function(d) { return d.name; })
-            .on('click', function(d) {
-                zoomToEntity(d.id);
+        function keydown() {
+            // hack to let delete shortcut work when search is autofocused
+            if (search.property('value').length === 0 &&
+                (d3.event.keyCode === d3.keybinding.keyCodes['⌫'] ||
+                 d3.event.keyCode === d3.keybinding.keyCodes['⌦'])) {
                 d3.event.preventDefault();
-            });
-
-        var details = enter
-            .append('div')
-            .attr('class', 'conflict-detail-container');
-
-        details
-            .append('ul')
-            .attr('class', 'conflict-detail-list')
-            .selectAll('li')
-            .data(function(d) { return d.details || []; })
-            .enter()
-            .append('li')
-            .attr('class', 'conflict-detail-item')
-            .html(function(d) { return d; });
-
-        details
-            .append('div')
-            .attr('class', 'conflict-choices')
-            .call(addChoices);
-
-        details
-            .append('div')
-            .attr('class', 'conflict-nav-buttons joined cf')
-            .selectAll('button')
-            .data(['previous', 'next'])
-            .enter()
-            .append('button')
-            .text(function(d) { return t('save.conflict.' + d); })
-            .attr('class', 'conflict-nav-button action col6')
-            .attr('disabled', function(d, i) {
-                return (i === 0 && index === 0) ||
-                    (i === 1 && index === list.length - 1) || null;
-            })
-            .on('click', function(d, i) {
-                var container = parent.select('.conflict-container'),
-                sign = (i === 0 ? -1 : 1);
-
-                container
-                    .selectAll('.conflict')
-                    .remove();
-
-                container
-                    .call(showConflict, index + sign);
-
+                d3.event.stopPropagation();
+                iD.operations.Delete([id], context)();
+            } else if (search.property('value').length === 0 &&
+                (d3.event.ctrlKey || d3.event.metaKey) &&
+                d3.event.keyCode === d3.keybinding.keyCodes.z) {
                 d3.event.preventDefault();
-            });
-
-        item.exit()
-            .remove();
-
-    }
-
-    function addChoices(selection) {
-        var choices = selection
-            .append('ul')
-            .attr('class', 'layer-list')
-            .selectAll('li')
-            .data(function(d) { return d.choices || []; });
-
-        var enter = choices.enter()
-            .append('li')
-            .attr('class', 'layer');
-
-        var label = enter
-            .append('label');
-
-        label
-            .append('input')
-            .attr('type', 'radio')
-            .attr('name', function(d) { return d.id; })
-            .on('change', function(d, i) {
-                var ul = this.parentNode.parentNode.parentNode;
-                ul.__data__.chosen = i;
-                choose(ul, d);
-            });
-
-        label
-            .append('span')
-            .text(function(d) { return d.text; });
-
-        choices
-            .each(function(d, i) {
-                var ul = this.parentNode;
-                if (ul.__data__.chosen === i) choose(ul, d);
-            });
-    }
-
-    function choose(ul, datum) {
-        if (d3.event) d3.event.preventDefault();
-
-        d3.select(ul)
-            .selectAll('li')
-            .classed('active', function(d) { return d === datum; })
-            .selectAll('input')
-            .property('checked', function(d) { return d === datum; });
-
-        var extent = iD.geo.Extent(),
-            entity;
-
-        entity = context.graph().hasEntity(datum.id);
-        if (entity) extent._extend(entity.extent(context.graph()));
-
-        datum.action();
-
-        entity = context.graph().hasEntity(datum.id);
-        if (entity) extent._extend(entity.extent(context.graph()));
-
-        zoomToEntity(datum.id, extent);
-    }
-
-    function zoomToEntity(id, extent) {
-        context.surface().selectAll('.hover')
-            .classed('hover', false);
-
-        var entity = context.graph().hasEntity(id);
-        if (entity) {
-            if (extent) {
-                context.map().trimmedExtent(extent);
-            } else {
-                context.map().zoomTo(entity);
+                d3.event.stopPropagation();
+                context.undo();
+            } else if (!d3.event.ctrlKey && !d3.event.metaKey) {
+                d3.select(this).on('keydown', null);
             }
-            context.surface().selectAll(
-                iD.util.entityOrMemberSelector([entity.id], context.graph()))
-                .classed('hover', true);
         }
+
+        function keypress() {
+            // enter
+            var value = search.property('value');
+            if (d3.event.keyCode === 13 && value.length) {
+                list.selectAll('.preset-list-item:first-child').datum().choose();
+            }
+        }
+
+        function inputevent() {
+            var value = search.property('value');
+            list.classed('filtered', value.length);
+            if (value.length) {
+                var results = presets.search(value, geometry);
+                message.text(t('inspector.results', {
+                    n: results.collection.length,
+                    search: value
+                }));
+                list.call(drawList, results);
+            } else {
+                list.call(drawList, context.presets().defaults(geometry, 36));
+                message.text(t('inspector.choose'));
+            }
+        }
+
+        var searchWrap = selection.append('div')
+            .attr('class', 'search-header');
+
+        var search = searchWrap.append('input')
+            .attr('class', 'preset-search-input')
+            .attr('placeholder', t('inspector.search'))
+            .attr('type', 'search')
+            .on('keydown', keydown)
+            .on('keypress', keypress)
+            .on('input', inputevent);
+
+        searchWrap
+            .call(iD.svg.Icon('#icon-search', 'pre-text'));
+
+        if (autofocus) {
+            search.node().focus();
+        }
+
+        var listWrap = selection.append('div')
+            .attr('class', 'inspector-body');
+
+        var list = listWrap.append('div')
+            .attr('class', 'preset-list fillL cf')
+            .call(drawList, context.presets().defaults(geometry, 36));
     }
 
+    function drawList(list, presets) {
+        var collection = presets.collection.map(function(preset) {
+            return preset.members ? CategoryItem(preset) : PresetItem(preset);
+        });
 
-    // The conflict list should be an array of objects like:
-    // {
-    //     id: id,
-    //     name: entityName(local),
-    //     details: merge.conflicts(),
-    //     chosen: 1,
-    //     choices: [
-    //         choice(id, keepMine, forceLocal),
-    //         choice(id, keepTheirs, forceRemote)
-    //     ]
-    // }
-    conflicts.list = function(_) {
-        if (!arguments.length) return list;
-        list = _;
-        return conflicts;
+        var items = list.selectAll('.preset-list-item')
+            .data(collection, function(d) { return d.preset.id; });
+
+        items.enter().append('div')
+            .attr('class', function(item) { return 'preset-list-item preset-' + item.preset.id.replace('/', '-'); })
+            .classed('current', function(item) { return item.preset === currentPreset; })
+            .each(function(item) {
+                d3.select(this).call(item);
+            })
+            .style('opacity', 0)
+            .transition()
+            .style('opacity', 1);
+
+        items.order();
+
+        items.exit()
+            .remove();
+    }
+
+    function CategoryItem(preset) {
+        var box, sublist, shown = false;
+
+        function item(selection) {
+            var wrap = selection.append('div')
+                .attr('class', 'preset-list-button-wrap category col12');
+
+            wrap.append('button')
+                .attr('class', 'preset-list-button')
+                .call(iD.ui.PresetIcon()
+                    .geometry(context.geometry(id))
+                    .preset(preset))
+                .on('click', item.choose)
+                .append('div')
+                .attr('class', 'label')
+                .text(preset.name());
+
+            box = selection.append('div')
+                .attr('class', 'subgrid col12')
+                .style('max-height', '0px')
+                .style('opacity', 0);
+
+            box.append('div')
+                .attr('class', 'arrow');
+
+            sublist = box.append('div')
+                .attr('class', 'preset-list fillL3 cf fl');
+        }
+
+        item.choose = function() {
+            if (!box || !sublist) return;
+
+            if (shown) {
+                shown = false;
+                box.transition()
+                    .duration(200)
+                    .style('opacity', '0')
+                    .style('max-height', '0px')
+                    .style('padding-bottom', '0px');
+            } else {
+                shown = true;
+                sublist.call(drawList, preset.members);
+                box.transition()
+                    .duration(200)
+                    .style('opacity', '1')
+                    .style('max-height', 200 + preset.members.collection.length * 80 + 'px')
+                    .style('padding-bottom', '20px');
+            }
+        };
+
+        item.preset = preset;
+
+        return item;
+    }
+
+    function PresetItem(preset) {
+        function item(selection) {
+            var wrap = selection.append('div')
+                .attr('class', 'preset-list-button-wrap col12');
+
+            wrap.append('button')
+                .attr('class', 'preset-list-button')
+                .call(iD.ui.PresetIcon()
+                    .geometry(context.geometry(id))
+                    .preset(preset))
+                .on('click', item.choose)
+                .append('div')
+                .attr('class', 'label')
+                .text(preset.name());
+
+            wrap.call(item.reference.button);
+            selection.call(item.reference.body);
+        }
+
+        item.choose = function() {
+            context.presets().choose(preset);
+
+            context.perform(
+                iD.actions.ChangePreset(id, currentPreset, preset),
+                t('operations.change_tags.annotation'));
+
+            event.choose(preset);
+        };
+
+        item.help = function() {
+            d3.event.stopPropagation();
+            item.reference.toggle();
+        };
+
+        item.preset = preset;
+        item.reference = iD.ui.TagReference(preset.reference(context.geometry(id)), context);
+
+        return item;
+    }
+
+    presetList.autofocus = function(_) {
+        if (!arguments.length) return autofocus;
+        autofocus = _;
+        return presetList;
     };
 
-    return d3.rebind(conflicts, dispatch, 'on');
+    presetList.entityID = function(_) {
+        if (!arguments.length) return id;
+        id = _;
+        presetList.preset(context.presets().match(context.entity(id), context.graph()));
+        return presetList;
+    };
+
+    presetList.preset = function(_) {
+        if (!arguments.length) return currentPreset;
+        currentPreset = _;
+        return presetList;
+    };
+
+    return d3.rebind(presetList, event, 'on');
 };
-iD.ui.flash = function(selection) {
-    var modal = iD.ui.modal(selection);
+iD.ui.Account = function(context) {
+    var connection = context.connection();
 
-    modal.select('.modal').classed('modal-flash', true);
+    function update(selection) {
+        if (!connection.authenticated()) {
+            selection.selectAll('#userLink, #logoutLink')
+                .classed('hide', true);
+            return;
+        }
 
-    modal.select('.content')
-        .classed('modal-section', true)
-        .append('div')
-        .attr('class', 'description');
+        connection.userDetails(function(err, details) {
+            var userLink = selection.select('#userLink'),
+                logoutLink = selection.select('#logoutLink');
 
-    modal.on('click.flash', function() { modal.remove(); });
+            userLink.html('');
+            logoutLink.html('');
 
-    setTimeout(function() {
-        modal.remove();
-        return true;
-    }, 1500);
+            if (err) return;
 
-    return modal;
+            selection.selectAll('#userLink, #logoutLink')
+                .classed('hide', false);
+
+            // Link
+            userLink.append('a')
+                .attr('href', connection.userURL(details.display_name))
+                .attr('target', '_blank');
+
+            // Add thumbnail or dont
+            if (details.image_url) {
+                userLink.append('img')
+                    .attr('class', 'icon pre-text user-icon')
+                    .attr('src', details.image_url);
+            } else {
+                userLink
+                    .call(iD.svg.Icon('#icon-avatar', 'pre-text light'));
+            }
+
+            // Add user name
+            userLink.append('span')
+                .attr('class', 'label')
+                .text(details.display_name);
+
+            logoutLink.append('a')
+                .attr('class', 'logout')
+                .attr('href', '#')
+                .text(t('logout'))
+                .on('click.logout', function() {
+                    d3.event.preventDefault();
+                    connection.logout();
+                });
+        });
+    }
+
+    return function(selection) {
+        selection.append('li')
+            .attr('id', 'logoutLink')
+            .classed('hide', true);
+
+        selection.append('li')
+            .attr('id', 'userLink')
+            .classed('hide', true);
+
+        connection.on('auth.account', function() { update(selection); });
+        update(selection);
+    };
 };
 iD.ui.Scale = function(context) {
     var projection = context.projection,
@@ -36185,194 +36470,40 @@ iD.ui.Scale = function(context) {
         });
     };
 };
-iD.ui.intro = function(context) {
-    var step;
+iD.ui.Status = function(context) {
+    var connection = context.connection(),
+        errCount = 0;
 
-    function intro(selection) {
+    return function(selection) {
 
-        function localizedName(id) {
-            var features = {
-                n2140018997: 'city_hall',
-                n367813436: 'fire_department',
-                w203988286: 'memory_isle_park',
-                w203972937: 'riverwalk_trail',
-                w203972938: 'riverwalk_trail',
-                w203972940: 'riverwalk_trail',
-                w41785752: 'w_michigan_ave',
-                w134150789: 'w_michigan_ave',
-                w134150795: 'w_michigan_ave',
-                w134150800: 'w_michigan_ave',
-                w134150811: 'w_michigan_ave',
-                w134150802: 'e_michigan_ave',
-                w134150836: 'e_michigan_ave',
-                w41074896: 'e_michigan_ave',
-                w17965834: 'spring_st',
-                w203986457: 'scidmore_park',
-                w203049587: 'petting_zoo',
-                w17967397: 'n_andrews_st',
-                w17967315: 's_andrews_st',
-                w17967326: 'n_constantine_st',
-                w17966400: 's_constantine_st',
-                w170848823: 'rocky_river',
-                w170848824: 'rocky_river',
-                w170848331: 'rocky_river',
-                w17967752: 'railroad_dr',
-                w17965998: 'conrail_rr',
-                w134150845: 'conrail_rr',
-                w170989131: 'st_joseph_river',
-                w143497377: 'n_main_st',
-                w134150801: 's_main_st',
-                w134150830: 's_main_st',
-                w17966462: 's_main_st',
-                w17967734: 'water_st',
-                w17964996: 'foster_st',
-                w170848330: 'portage_river',
-                w17965351: 'flower_st',
-                w17965502: 'elm_st',
-                w17965402: 'walnut_st',
-                w17964793: 'morris_ave',
-                w17967444: 'east_st',
-                w17966984: 'portage_ave'
-            };
-            return features[id] && t('intro.graph.' + features[id]);
-        }
+        function update() {
 
-        context.enter(iD.modes.Browse(context));
+            connection.status(function(err, apiStatus) {
 
-        // Save current map state
-        var history = context.history().toJSON(),
-            hash = window.location.hash,
-            center = context.map().center(),
-            zoom = context.map().zoom(),
-            background = context.background().baseLayerSource(),
-            opacity = d3.select('.background-layer').style('opacity'),
-            loadedTiles = context.connection().loadedTiles(),
-            baseEntities = context.history().graph().base().entities,
-            introGraph, name;
+                selection.html('');
 
-        // Block saving
-        context.inIntro(true);
+                if (err && errCount++ < 2) return;
 
-        // Load semi-real data used in intro
-        context.connection().toggle(false).flush();
-        context.history().reset();
+                if (err) {
+                    selection.text(t('status.error'));
 
-        introGraph = JSON.parse(iD.introGraph);
-        for (var key in introGraph) {
-            introGraph[key] = iD.Entity(introGraph[key]);
-            name = localizedName(key);
-            if (name) {
-                introGraph[key].tags.name = name;
-            }
-        }
-        context.history().merge(d3.values(iD.Graph().load(introGraph).entities));
-        context.background().bing();
+                } else if (apiStatus === 'readonly') {
+                    selection.text(t('status.readonly'));
 
-        d3.select('.background-layer').style('opacity', 1);
+                } else if (apiStatus === 'offline') {
+                    selection.text(t('status.offline'));
+                }
 
-        var curtain = d3.curtain();
-        selection.call(curtain);
+                selection.attr('class', 'api-status ' + (err ? 'error' : apiStatus));
+                if (!err) errCount = 0;
 
-        function reveal(box, text, options) {
-            options = options || {};
-            if (text) curtain.reveal(box, text, options.tooltipClass, options.duration);
-            else curtain.reveal(box, '', '', options.duration);
-        }
-
-        var steps = ['navigation', 'point', 'area', 'line', 'startEditing'].map(function(step, i) {
-            var s = iD.ui.intro[step](context, reveal)
-                .on('done', function() {
-                    entered.filter(function(d) {
-                        return d.title === s.title;
-                    }).classed('finished', true);
-                    enter(steps[i + 1]);
-                });
-            return s;
-        });
-
-        steps[steps.length - 1].on('startEditing', function() {
-            curtain.remove();
-            navwrap.remove();
-            d3.select('.background-layer').style('opacity', opacity);
-            context.connection().toggle(true).flush().loadedTiles(loadedTiles);
-            context.history().reset().merge(d3.values(baseEntities));
-            context.background().baseLayerSource(background);
-            if (history) context.history().fromJSON(history, false);
-            context.map().centerZoom(center, zoom);
-            window.location.replace(hash);
-            context.inIntro(false);
-        });
-
-        var navwrap = selection.append('div').attr('class', 'intro-nav-wrap fillD');
-
-        var buttonwrap = navwrap.append('div')
-            .attr('class', 'joined')
-            .selectAll('button.step');
-
-        var entered = buttonwrap
-            .data(steps)
-            .enter()
-            .append('button')
-            .attr('class', 'step')
-            .on('click', enter);
-
-        entered
-            .call(iD.svg.Icon('#icon-apply', 'pre-text'));
-
-        entered
-            .append('label')
-            .text(function(d) { return t(d.title); });
-
-        enter(steps[0]);
-
-        function enter (newStep) {
-            if (step) { step.exit(); }
-
-            context.enter(iD.modes.Browse(context));
-
-            step = newStep;
-            step.enter();
-
-            entered.classed('active', function(d) {
-                return d.title === step.title;
             });
         }
 
-    }
-    return intro;
-};
-
-iD.ui.intro.pointBox = function(point, context) {
-    var rect = context.surfaceRect();
-    point = context.projection(point);
-    return {
-        left: point[0] + rect.left - 30,
-        top: point[1] + rect.top - 50,
-        width: 60,
-        height: 70
+        connection.on('auth', function() { update(selection); });
+        window.setInterval(update, 90000);
+        update(selection);
     };
-};
-
-iD.ui.intro.pad = function(box, padding, context) {
-    if (box instanceof Array) {
-        var rect = context.surfaceRect();
-        box = context.projection(box);
-        box = {
-            left: box[0] + rect.left,
-            top: box[1] + rect.top
-        };
-    }
-    return {
-        left: box.left - padding,
-        top: box.top - padding,
-        width: (box.width || 0) + 2 * padding,
-        height: (box.width || 0) + 2 * padding
-    };
-};
-
-iD.ui.intro.icon = function(name, svgklass) {
-    return '<svg class="icon ' + (svgklass || '') + '">' +
-        '<use xlink:href="' + name + '"></use></svg>';
 };
 iD.ui.preset = function(context) {
     var event = d3.dispatch('change'),
@@ -36641,23 +36772,47 @@ iD.ui.preset = function(context) {
 
     return d3.rebind(presets, event, 'on');
 };
-// toggles the visibility of ui elements, using a combination of the
-// hide class, which sets display=none, and a d3 transition for opacity.
-// this will cause blinking when called repeatedly, so check that the
-// value actually changes between calls.
-iD.ui.Toggle = function(show, callback) {
+iD.ui.Splash = function(context) {
     return function(selection) {
-        selection
-            .style('opacity', show ? 0 : 1)
-            .classed('hide', false)
-            .transition()
-            .style('opacity', show ? 1 : 0)
-            .each('end', function() {
-                d3.select(this)
-                    .classed('hide', !show)
-                    .style('opacity', null);
-                if (callback) callback.apply(this);
+        if (context.storage('sawSplash'))
+             return;
+
+        context.storage('sawSplash', true);
+
+        var modal = iD.ui.modal(selection);
+
+        modal.select('.modal')
+            .attr('class', 'modal-splash modal col6');
+
+        var introModal = modal.select('.content')
+            .append('div')
+            .attr('class', 'fillL');
+
+        introModal.append('div')
+            .attr('class','modal-section cf')
+            .append('h3').text(t('splash.welcome'));
+
+        introModal.append('div')
+            .attr('class','modal-section')
+            .append('p')
+            .html(t('splash.text'));
+
+        var buttons = introModal.append('div').attr('class', 'modal-actions cf');
+
+        buttons.append('button')
+            .attr('class', 'col6')
+            .text(t('splash.walkthrough'))
+            .on('click', function() {
+                window.location = 'http://labs.strava.com/slide';
             });
+
+        buttons.append('button')
+            .attr('class', 'col6 start')
+            .text(t('splash.start'))
+            .on('click', modal.close);
+
+        modal.select('button.close').attr('class','hide');
+
     };
 };
 iD.ui.Attribution = function(context) {
@@ -36740,47 +36895,29 @@ iD.ui.Attribution = function(context) {
         update();
     };
 };
-iD.ui.Splash = function(context) {
+iD.ui.Notice = function(context) {
     return function(selection) {
-        if (context.storage('sawSplash'))
-             return;
+        var div = selection.append('div')
+            .attr('class', 'notice');
 
-        context.storage('sawSplash', true);
+        var button = div.append('button')
+            .attr('class', 'zoom-to notice')
+            .on('click', function() { context.map().zoom(context.minEditableZoom()); });
 
-        var modal = iD.ui.modal(selection);
+        button
+            .call(iD.svg.Icon('#icon-plus', 'pre-text'))
+            .append('span')
+            .attr('class', 'label')
+            .text(t('zoom_in_edit'));
 
-        modal.select('.modal')
-            .attr('class', 'modal-splash modal col6');
+        function disableTooHigh() {
+            div.style('display', context.editable() ? 'none' : 'block');
+        }
 
-        var introModal = modal.select('.content')
-            .append('div')
-            .attr('class', 'fillL');
+        context.map()
+            .on('move.notice', _.debounce(disableTooHigh, 500));
 
-        introModal.append('div')
-            .attr('class','modal-section cf')
-            .append('h3').text(t('splash.welcome'));
-
-        introModal.append('div')
-            .attr('class','modal-section')
-            .append('p')
-            .html(t('splash.text'));
-
-        var buttons = introModal.append('div').attr('class', 'modal-actions cf');
-
-        buttons.append('button')
-            .attr('class', 'col6')
-            .text(t('splash.walkthrough'))
-            .on('click', function() {
-                window.location = 'http://labs.strava.com/slide';
-            });
-
-        buttons.append('button')
-            .attr('class', 'col6 start')
-            .text(t('splash.start'))
-            .on('click', modal.close);
-
-        modal.select('button.close').attr('class','hide');
-
+        disableTooHigh();
     };
 };
 // Translate a MacOS key command into the appropriate Windows/Linux equivalent.
@@ -36813,247 +36950,45 @@ iD.ui.cmd = function(code) {
 
     return result;
 };
-iD.ui.PresetList = function(context) {
-    var event = d3.dispatch('choose'),
-        id,
-        currentPreset,
-        autofocus = false;
+iD.ui.SourceSwitch = function(context) {
+    var keys;
 
-    function presetList(selection) {
-        var geometry = context.geometry(id),
-            presets = context.presets().matchGeometry(geometry);
+    function click() {
+        d3.event.preventDefault();
 
-        selection.html('');
+        if (context.history().hasChanges() &&
+            !window.confirm(t('source_switch.lose_changes'))) return;
 
-        var messagewrap = selection.append('div')
-            .attr('class', 'header fillL cf');
+        var live = d3.select(this)
+            .classed('live');
 
-        var message = messagewrap.append('h3')
-            .text(t('inspector.choose'));
+        context.connection()
+            .switch(live ? keys[1] : keys[0]);
 
-        if (context.entity(id).isUsed(context.graph())) {
-            messagewrap.append('button')
-                .attr('class', 'preset-choose')
-                .on('click', function() { event.choose(currentPreset); })
-                .append('span')
-                .html('&#9658;');
-        } else {
-            messagewrap.append('button')
-                .attr('class', 'close')
-                .on('click', function() {
-                    context.enter(iD.modes.Browse(context));
-                })
-                .call(iD.svg.Icon('#icon-close'));
-        }
+        context.enter(iD.modes.Browse(context));
+        context.flush();
 
-        function keydown() {
-            // hack to let delete shortcut work when search is autofocused
-            if (search.property('value').length === 0 &&
-                (d3.event.keyCode === d3.keybinding.keyCodes['⌫'] ||
-                 d3.event.keyCode === d3.keybinding.keyCodes['⌦'])) {
-                d3.event.preventDefault();
-                d3.event.stopPropagation();
-                iD.operations.Delete([id], context)();
-            } else if (search.property('value').length === 0 &&
-                (d3.event.ctrlKey || d3.event.metaKey) &&
-                d3.event.keyCode === d3.keybinding.keyCodes.z) {
-                d3.event.preventDefault();
-                d3.event.stopPropagation();
-                context.undo();
-            } else if (!d3.event.ctrlKey && !d3.event.metaKey) {
-                d3.select(this).on('keydown', null);
-            }
-        }
-
-        function keypress() {
-            // enter
-            var value = search.property('value');
-            if (d3.event.keyCode === 13 && value.length) {
-                list.selectAll('.preset-list-item:first-child').datum().choose();
-            }
-        }
-
-        function inputevent() {
-            var value = search.property('value');
-            list.classed('filtered', value.length);
-            if (value.length) {
-                var results = presets.search(value, geometry);
-                message.text(t('inspector.results', {
-                    n: results.collection.length,
-                    search: value
-                }));
-                list.call(drawList, results);
-            } else {
-                list.call(drawList, context.presets().defaults(geometry, 36));
-                message.text(t('inspector.choose'));
-            }
-        }
-
-        var searchWrap = selection.append('div')
-            .attr('class', 'search-header');
-
-        var search = searchWrap.append('input')
-            .attr('class', 'preset-search-input')
-            .attr('placeholder', t('inspector.search'))
-            .attr('type', 'search')
-            .on('keydown', keydown)
-            .on('keypress', keypress)
-            .on('input', inputevent);
-
-        searchWrap
-            .call(iD.svg.Icon('#icon-search', 'pre-text'));
-
-        if (autofocus) {
-            search.node().focus();
-        }
-
-        var listWrap = selection.append('div')
-            .attr('class', 'inspector-body');
-
-        var list = listWrap.append('div')
-            .attr('class', 'preset-list fillL cf')
-            .call(drawList, context.presets().defaults(geometry, 36));
+        d3.select(this)
+            .text(live ? t('source_switch.dev') : t('source_switch.live'))
+            .classed('live', !live);
     }
 
-    function drawList(list, presets) {
-        var collection = presets.collection.map(function(preset) {
-            return preset.members ? CategoryItem(preset) : PresetItem(preset);
-        });
-
-        var items = list.selectAll('.preset-list-item')
-            .data(collection, function(d) { return d.preset.id; });
-
-        items.enter().append('div')
-            .attr('class', function(item) { return 'preset-list-item preset-' + item.preset.id.replace('/', '-'); })
-            .classed('current', function(item) { return item.preset === currentPreset; })
-            .each(function(item) {
-                d3.select(this).call(item);
-            })
-            .style('opacity', 0)
-            .transition()
-            .style('opacity', 1);
-
-        items.order();
-
-        items.exit()
-            .remove();
-    }
-
-    function CategoryItem(preset) {
-        var box, sublist, shown = false;
-
-        function item(selection) {
-            var wrap = selection.append('div')
-                .attr('class', 'preset-list-button-wrap category col12');
-
-            wrap.append('button')
-                .attr('class', 'preset-list-button')
-                .call(iD.ui.PresetIcon()
-                    .geometry(context.geometry(id))
-                    .preset(preset))
-                .on('click', item.choose)
-                .append('div')
-                .attr('class', 'label')
-                .text(preset.name());
-
-            box = selection.append('div')
-                .attr('class', 'subgrid col12')
-                .style('max-height', '0px')
-                .style('opacity', 0);
-
-            box.append('div')
-                .attr('class', 'arrow');
-
-            sublist = box.append('div')
-                .attr('class', 'preset-list fillL3 cf fl');
-        }
-
-        item.choose = function() {
-            if (!box || !sublist) return;
-
-            if (shown) {
-                shown = false;
-                box.transition()
-                    .duration(200)
-                    .style('opacity', '0')
-                    .style('max-height', '0px')
-                    .style('padding-bottom', '0px');
-            } else {
-                shown = true;
-                sublist.call(drawList, preset.members);
-                box.transition()
-                    .duration(200)
-                    .style('opacity', '1')
-                    .style('max-height', 200 + preset.members.collection.length * 80 + 'px')
-                    .style('padding-bottom', '20px');
-            }
-        };
-
-        item.preset = preset;
-
-        return item;
-    }
-
-    function PresetItem(preset) {
-        function item(selection) {
-            var wrap = selection.append('div')
-                .attr('class', 'preset-list-button-wrap col12');
-
-            wrap.append('button')
-                .attr('class', 'preset-list-button')
-                .call(iD.ui.PresetIcon()
-                    .geometry(context.geometry(id))
-                    .preset(preset))
-                .on('click', item.choose)
-                .append('div')
-                .attr('class', 'label')
-                .text(preset.name());
-
-            wrap.call(item.reference.button);
-            selection.call(item.reference.body);
-        }
-
-        item.choose = function() {
-            context.presets().choose(preset);
-
-            context.perform(
-                iD.actions.ChangePreset(id, currentPreset, preset),
-                t('operations.change_tags.annotation'));
-
-            event.choose(preset);
-        };
-
-        item.help = function() {
-            d3.event.stopPropagation();
-            item.reference.toggle();
-        };
-
-        item.preset = preset;
-        item.reference = iD.ui.TagReference(preset.reference(context.geometry(id)), context);
-
-        return item;
-    }
-
-    presetList.autofocus = function(_) {
-        if (!arguments.length) return autofocus;
-        autofocus = _;
-        return presetList;
+    var sourceSwitch = function(selection) {
+        selection.append('a')
+            .attr('href', '#')
+            .text(t('source_switch.live'))
+            .classed('live', true)
+            .attr('tabindex', -1)
+            .on('click', click);
     };
 
-    presetList.entityID = function(_) {
-        if (!arguments.length) return id;
-        id = _;
-        presetList.preset(context.presets().match(context.entity(id), context.graph()));
-        return presetList;
+    sourceSwitch.keys = function(_) {
+        if (!arguments.length) return keys;
+        keys = _;
+        return sourceSwitch;
     };
 
-    presetList.preset = function(_) {
-        if (!arguments.length) return currentPreset;
-        currentPreset = _;
-        return presetList;
-    };
-
-    return d3.rebind(presetList, event, 'on');
+    return sourceSwitch;
 };
 iD.ui.Disclosure = function() {
     var dispatch = d3.dispatch('toggled'),
@@ -37344,6 +37279,71 @@ iD.ui.Success = function(context) {
     };
 
     return d3.rebind(success, dispatch, 'on');
+};
+iD.ui.Contributors = function(context) {
+    function update(selection) {
+        var users = {},
+            limit = 4,
+            entities = context.intersects(context.map().extent());
+
+        entities.forEach(function(entity) {
+            if (entity && entity.user) users[entity.user] = true;
+        });
+
+        var u = Object.keys(users),
+            subset = u.slice(0, u.length > limit ? limit - 1 : limit);
+
+        selection.html('')
+            .call(iD.svg.Icon('#icon-nearby', 'pre-text light'));
+
+        var userList = d3.select(document.createElement('span'));
+
+        userList.selectAll()
+            .data(subset)
+            .enter()
+            .append('a')
+            .attr('class', 'user-link')
+            .attr('href', function(d) { return context.connection().userURL(d); })
+            .attr('target', '_blank')
+            .attr('tabindex', -1)
+            .text(String);
+
+        if (u.length > limit) {
+            var count = d3.select(document.createElement('span'));
+
+            count.append('a')
+                .attr('target', '_blank')
+                .attr('tabindex', -1)
+                .attr('href', function() {
+                    return context.connection().changesetsURL(context.map().center(), context.map().zoom());
+                })
+                .text(u.length - limit + 1);
+
+            selection.append('span')
+                .html(t('contributors.truncated_list', {users: userList.html(), count: count.html()}));
+        } else {
+            selection.append('span')
+                .html(t('contributors.list', {users: userList.html()}));
+        }
+
+        if (!u.length) {
+            selection.transition().style('opacity', 0);
+        } else if (selection.style('opacity') === '0') {
+            selection.transition().style('opacity', 1);
+        }
+    }
+
+    return function(selection) {
+        update(selection);
+
+        context.connection().on('loaded.contributors', function() {
+            update(selection);
+        });
+
+        context.map().on('move.contributors', _.debounce(function() {
+            update(selection);
+        }, 500));
+    };
 };
 iD.ui.Modes = function(context) {
     var modes = [
