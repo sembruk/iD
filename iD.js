@@ -20527,103 +20527,281 @@ iD.geo.joinWays = function(array, graph) {
     return joined;
 };
 iD.actions = {};
-iD.actions.DeleteMember = function(relationId, memberIndex) {
-    return function(graph) {
-        var relation = graph.entity(relationId)
-            .removeMember(memberIndex);
+// https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/command/MoveCommand.java
+// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MoveNodeAction.as
+iD.actions.Move = function(moveIds, tryDelta, projection, cache) {
+    var delta = tryDelta;
 
-        graph = graph.replace(relation);
+    function vecAdd(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
+    function vecSub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
 
-        if (relation.isDegenerate())
-            graph = iD.actions.DeleteRelation(relation.id)(graph);
+    function setupCache(graph) {
+        function canMove(nodeId) {
+            var parents = _.pluck(graph.parentWays(graph.entity(nodeId)), 'id');
+            if (parents.length < 3) return true;
 
-        return graph;
-    };
-};
-// Join ways at the end node they share.
-//
-// This is the inverse of `iD.actions.Split`.
-//
-// Reference:
-//   https://github.com/systemed/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MergeWaysAction.as
-//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/CombineWayAction.java
-//
-iD.actions.Join = function(ids) {
+            // Don't move a vertex where >2 ways meet, unless all parentWays are moving too..
+            var parentsMoving = _.all(parents, function(id) { return cache.moving[id]; });
+            if (!parentsMoving) delete cache.moving[nodeId];
 
-    function groupEntitiesByGeometry(graph) {
-        var entities = ids.map(function(id) { return graph.entity(id); });
-        return _.extend({line: []}, _.groupBy(entities, function(entity) { return entity.geometry(graph); }));
-    }
-
-    var action = function(graph) {
-        var ways = ids.map(graph.entity, graph),
-            survivor = ways[0];
-
-        // Prefer to keep an existing way.
-        for (var i = 0; i < ways.length; i++) {
-            if (!ways[i].isNew()) {
-                survivor = ways[i];
-                break;
-            }
+            return parentsMoving;
         }
 
-        var joined = iD.geo.joinWays(ways, graph)[0];
+        function cacheEntities(ids) {
+            _.each(ids, function(id) {
+                if (cache.moving[id]) return;
+                cache.moving[id] = true;
 
-        survivor = survivor.update({nodes: _.pluck(joined.nodes, 'id')});
-        graph = graph.replace(survivor);
+                var entity = graph.hasEntity(id);
+                if (!entity) return;
 
-        joined.forEach(function(way) {
-            if (way.id === survivor.id)
-                return;
-
-            graph.parentRelations(way).forEach(function(parent) {
-                graph = graph.replace(parent.replaceMember(way, survivor));
+                if (entity.type === 'node') {
+                    cache.nodes.push(id);
+                    cache.startLoc[id] = entity.loc;
+                } else if (entity.type === 'way') {
+                    cache.ways.push(id);
+                    cacheEntities(entity.nodes);
+                } else {
+                    cacheEntities(_.pluck(entity.members, 'id'));
+                }
             });
+        }
 
-            survivor = survivor.mergeTags(way.tags);
+        function cacheIntersections(ids) {
+            function isEndpoint(way, id) { return !way.isClosed() && !!way.affix(id); }
 
-            graph = graph.replace(survivor);
-            graph = iD.actions.DeleteWay(way.id)(graph);
+            _.each(ids, function(id) {
+                // consider only intersections with 1 moved and 1 unmoved way.
+                _.each(graph.childNodes(graph.entity(id)), function(node) {
+                    var parents = graph.parentWays(node);
+                    if (parents.length !== 2) return;
+
+                    var moved = graph.entity(id),
+                        unmoved = _.find(parents, function(way) { return !cache.moving[way.id]; });
+                    if (!unmoved) return;
+
+                    // exclude ways that are overly connected..
+                    if (_.intersection(moved.nodes, unmoved.nodes).length > 2) return;
+
+                    if (moved.isArea() || unmoved.isArea()) return;
+
+                    cache.intersection[node.id] = {
+                        nodeId: node.id,
+                        movedId: moved.id,
+                        unmovedId: unmoved.id,
+                        movedIsEP: isEndpoint(moved, node.id),
+                        unmovedIsEP: isEndpoint(unmoved, node.id)
+                    };
+                });
+            });
+        }
+
+
+        if (!cache) {
+            cache = {};
+        }
+        if (!cache.ok) {
+            cache.moving = {};
+            cache.intersection = {};
+            cache.replacedVertex = {};
+            cache.startLoc = {};
+            cache.nodes = [];
+            cache.ways = [];
+
+            cacheEntities(moveIds);
+            cacheIntersections(cache.ways);
+            cache.nodes = _.filter(cache.nodes, canMove);
+
+            cache.ok = true;
+        }
+    }
+
+
+    // Place a vertex where the moved vertex used to be, to preserve way shape..
+    function replaceMovedVertex(nodeId, wayId, graph, delta) {
+        var way = graph.entity(wayId),
+            moved = graph.entity(nodeId),
+            movedIndex = way.nodes.indexOf(nodeId),
+            len, prevIndex, nextIndex;
+
+        if (way.isClosed()) {
+            len = way.nodes.length - 1;
+            prevIndex = (movedIndex + len - 1) % len;
+            nextIndex = (movedIndex + len + 1) % len;
+        } else {
+            len = way.nodes.length;
+            prevIndex = movedIndex - 1;
+            nextIndex = movedIndex + 1;
+        }
+
+        var prev = graph.hasEntity(way.nodes[prevIndex]),
+            next = graph.hasEntity(way.nodes[nextIndex]);
+
+        // Don't add orig vertex at endpoint..
+        if (!prev || !next) return graph;
+
+        var key = wayId + '_' + nodeId,
+            orig = cache.replacedVertex[key];
+        if (!orig) {
+            orig = iD.Node();
+            cache.replacedVertex[key] = orig;
+            cache.startLoc[orig.id] = cache.startLoc[nodeId];
+        }
+
+        var start, end;
+        if (delta) {
+            start = projection(cache.startLoc[nodeId]);
+            end = projection.invert(vecAdd(start, delta));
+        } else {
+            end = cache.startLoc[nodeId];
+        }
+        orig = orig.move(end);
+
+        var angle = Math.abs(iD.geo.angle(orig, prev, projection) -
+                iD.geo.angle(orig, next, projection)) * 180 / Math.PI;
+
+        // Don't add orig vertex if it would just make a straight line..
+        if (angle > 175 && angle < 185) return graph;
+
+        // Don't add orig vertex if another point is already nearby (within 10m)
+        if (iD.geo.sphericalDistance(prev.loc, orig.loc) < 10 ||
+            iD.geo.sphericalDistance(orig.loc, next.loc) < 10) return graph;
+
+        // moving forward or backward along way?
+        var p1 = [prev.loc, orig.loc, moved.loc, next.loc].map(projection),
+            p2 = [prev.loc, moved.loc, orig.loc, next.loc].map(projection),
+            d1 = iD.geo.pathLength(p1),
+            d2 = iD.geo.pathLength(p2),
+            insertAt = (d1 < d2) ? movedIndex : nextIndex;
+
+        // moving around closed loop?
+        if (way.isClosed() && insertAt === 0) insertAt = len;
+
+        way = way.addNode(orig.id, insertAt);
+        return graph.replace(orig).replace(way);
+    }
+
+    // Reorder nodes around intersections that have moved..
+    function unZorroIntersection(intersection, graph) {
+        var vertex = graph.entity(intersection.nodeId),
+            way1 = graph.entity(intersection.movedId),
+            way2 = graph.entity(intersection.unmovedId),
+            isEP1 = intersection.movedIsEP,
+            isEP2 = intersection.unmovedIsEP;
+
+        // don't move the vertex if it is the endpoint of both ways.
+        if (isEP1 && isEP2) return graph;
+
+        var nodes1 = _.without(graph.childNodes(way1), vertex),
+            nodes2 = _.without(graph.childNodes(way2), vertex);
+
+        if (way1.isClosed() && way1.first() === vertex.id) nodes1.push(nodes1[0]);
+        if (way2.isClosed() && way2.first() === vertex.id) nodes2.push(nodes2[0]);
+
+        var edge1 = !isEP1 && iD.geo.chooseEdge(nodes1, projection(vertex.loc), projection),
+            edge2 = !isEP2 && iD.geo.chooseEdge(nodes2, projection(vertex.loc), projection),
+            loc;
+
+        // snap vertex to nearest edge (or some point between them)..
+        if (!isEP1 && !isEP2) {
+            var epsilon = 1e-4, maxIter = 10;
+            for (var i = 0; i < maxIter; i++) {
+                loc = iD.geo.interp(edge1.loc, edge2.loc, 0.5);
+                edge1 = iD.geo.chooseEdge(nodes1, projection(loc), projection);
+                edge2 = iD.geo.chooseEdge(nodes2, projection(loc), projection);
+                if (Math.abs(edge1.distance - edge2.distance) < epsilon) break;
+            }
+        } else if (!isEP1) {
+            loc = edge1.loc;
+        } else {
+            loc = edge2.loc;
+        }
+
+        graph = graph.replace(vertex.move(loc));
+
+        // if zorro happened, reorder nodes..
+        if (!isEP1 && edge1.index !== way1.nodes.indexOf(vertex.id)) {
+            way1 = way1.removeNode(vertex.id).addNode(vertex.id, edge1.index);
+            graph = graph.replace(way1);
+        }
+        if (!isEP2 && edge2.index !== way2.nodes.indexOf(vertex.id)) {
+            way2 = way2.removeNode(vertex.id).addNode(vertex.id, edge2.index);
+            graph = graph.replace(way2);
+        }
+
+        return graph;
+    }
+
+
+    function cleanupIntersections(graph) {
+        _.each(cache.intersection, function(obj) {
+            graph = replaceMovedVertex(obj.nodeId, obj.movedId, graph, delta);
+            graph = replaceMovedVertex(obj.nodeId, obj.unmovedId, graph, null);
+            graph = unZorroIntersection(obj, graph);
         });
+
+        return graph;
+    }
+
+    // check if moving way endpoint can cross an unmoved way, if so limit delta..
+    function limitDelta(graph) {
+        _.each(cache.intersection, function(obj) {
+            if (!obj.movedIsEP) return;
+
+            var node = graph.entity(obj.nodeId),
+                start = projection(node.loc),
+                end = vecAdd(start, delta),
+                movedNodes = graph.childNodes(graph.entity(obj.movedId)),
+                movedPath = _.map(_.pluck(movedNodes, 'loc'),
+                    function(loc) { return vecAdd(projection(loc), delta); }),
+                unmovedNodes = graph.childNodes(graph.entity(obj.unmovedId)),
+                unmovedPath = _.map(_.pluck(unmovedNodes, 'loc'), projection),
+                hits = iD.geo.pathIntersections(movedPath, unmovedPath);
+
+            for (var i = 0; i < hits.length; i++) {
+                if (_.isEqual(hits[i], end)) continue;
+                var edge = iD.geo.chooseEdge(unmovedNodes, end, projection);
+                delta = vecSub(projection(edge.loc), start);
+            }
+        });
+    }
+
+
+    var action = function(graph) {
+        if (delta[0] === 0 && delta[1] === 0) return graph;
+
+        setupCache(graph);
+
+        if (!_.isEmpty(cache.intersection)) {
+            limitDelta(graph);
+        }
+
+        _.each(cache.nodes, function(id) {
+            var node = graph.entity(id),
+                start = projection(node.loc),
+                end = vecAdd(start, delta);
+            graph = graph.replace(node.move(projection.invert(end)));
+        });
+
+        if (!_.isEmpty(cache.intersection)) {
+            graph = cleanupIntersections(graph);
+        }
 
         return graph;
     };
 
     action.disabled = function(graph) {
-        var geometries = groupEntitiesByGeometry(graph);
-        if (ids.length < 2 || ids.length !== geometries.line.length)
-            return 'not_eligible';
+        function incompleteRelation(id) {
+            var entity = graph.entity(id);
+            return entity.type === 'relation' && !entity.isComplete(graph);
+        }
 
-        var joined = iD.geo.joinWays(ids.map(graph.entity, graph), graph);
-        if (joined.length > 1)
-            return 'not_adjacent';
+        if (_.any(moveIds, incompleteRelation))
+            return 'incomplete_relation';
+    };
 
-        var nodeIds = _.pluck(joined[0].nodes, 'id').slice(1, -1),
-            relation,
-            tags = {},
-            conflicting = false;
-
-        joined[0].forEach(function(way) {
-            var parents = graph.parentRelations(way);
-            parents.forEach(function(parent) {
-                if (parent.isRestriction() && parent.members.some(function(m) { return nodeIds.indexOf(m.id) >= 0; }))
-                    relation = parent;
-            });
-
-            for (var k in way.tags) {
-                if (!(k in tags)) {
-                    tags[k] = way.tags[k];
-                } else if (tags[k] && iD.interestingTag(k) && tags[k] !== way.tags[k]) {
-                    conflicting = true;
-                }
-            }
-        });
-
-        if (relation)
-            return 'restriction';
-
-        if (conflicting)
-            return 'conflicting_tags';
+    action.delta = function() {
+        return delta;
     };
 
     return action;
@@ -21003,112 +21181,6 @@ iD.actions.AddEntity = function(way) {
         return graph.replace(way);
     };
 };
-iD.actions.DeleteMultiple = function(ids) {
-    var actions = {
-        way: iD.actions.DeleteWay,
-        node: iD.actions.DeleteNode,
-        relation: iD.actions.DeleteRelation
-    };
-
-    var action = function(graph) {
-        ids.forEach(function(id) {
-            if (graph.hasEntity(id)) { // It may have been deleted aready.
-                graph = actions[graph.entity(id).type](id)(graph);
-            }
-        });
-
-        return graph;
-    };
-
-    action.disabled = function(graph) {
-        for (var i = 0; i < ids.length; i++) {
-            var id = ids[i],
-                disabled = actions[graph.entity(id).type](id).disabled(graph);
-            if (disabled) return disabled;
-        }
-    };
-
-    return action;
-};
-// Connect the ways at the given nodes.
-//
-// The last node will survive. All other nodes will be replaced with
-// the surviving node in parent ways, and then removed.
-//
-// Tags and relation memberships of of non-surviving nodes are merged
-// to the survivor.
-//
-// This is the inverse of `iD.actions.Disconnect`.
-//
-// Reference:
-//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MergeNodesAction.as
-//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/MergeNodesAction.java
-//
-iD.actions.Connect = function(nodeIds) {
-    return function(graph) {
-        var survivor = graph.entity(_.last(nodeIds));
-
-        for (var i = 0; i < nodeIds.length - 1; i++) {
-            var node = graph.entity(nodeIds[i]);
-
-            /* eslint-disable no-loop-func */
-            graph.parentWays(node).forEach(function(parent) {
-                if (!parent.areAdjacent(node.id, survivor.id)) {
-                    graph = graph.replace(parent.replaceNode(node.id, survivor.id));
-                }
-            });
-
-            graph.parentRelations(node).forEach(function(parent) {
-                graph = graph.replace(parent.replaceMember(node, survivor));
-            });
-            /* eslint-enable no-loop-func */
-
-            survivor = survivor.mergeTags(node.tags);
-            graph = iD.actions.DeleteNode(node.id)(graph);
-        }
-
-        graph = graph.replace(survivor);
-
-        return graph;
-    };
-};
-iD.actions.Merge = function(ids) {
-    function groupEntitiesByGeometry(graph) {
-        var entities = ids.map(function(id) { return graph.entity(id); });
-        return _.extend({point: [], area: [], line: [], relation: []},
-            _.groupBy(entities, function(entity) { return entity.geometry(graph); }));
-    }
-
-    var action = function(graph) {
-        var geometries = groupEntitiesByGeometry(graph),
-            target = geometries.area[0] || geometries.line[0],
-            points = geometries.point;
-
-        points.forEach(function(point) {
-            target = target.mergeTags(point.tags);
-
-            graph.parentRelations(point).forEach(function(parent) {
-                graph = graph.replace(parent.replaceMember(point, target));
-            });
-
-            graph = graph.remove(point);
-        });
-
-        graph = graph.replace(target);
-
-        return graph;
-    };
-
-    action.disabled = function(graph) {
-        var geometries = groupEntitiesByGeometry(graph);
-        if (geometries.point.length === 0 ||
-            (geometries.area.length + geometries.line.length) !== 1 ||
-            geometries.relation.length !== 0)
-            return 'not_eligible';
-    };
-
-    return action;
-};
 iD.actions.MergeRemoteChanges = function(id, localGraph, remoteGraph, formatUser) {
     var option = 'safe',  // 'safe', 'force_local', 'force_remote'
         conflicts = [];
@@ -21364,6 +21436,228 @@ iD.actions.MergeRemoteChanges = function(id, localGraph, remoteGraph, formatUser
 
     return action;
 };
+iD.actions.DeleteMultiple = function(ids) {
+    var actions = {
+        way: iD.actions.DeleteWay,
+        node: iD.actions.DeleteNode,
+        relation: iD.actions.DeleteRelation
+    };
+
+    var action = function(graph) {
+        ids.forEach(function(id) {
+            if (graph.hasEntity(id)) { // It may have been deleted aready.
+                graph = actions[graph.entity(id).type](id)(graph);
+            }
+        });
+
+        return graph;
+    };
+
+    action.disabled = function(graph) {
+        for (var i = 0; i < ids.length; i++) {
+            var id = ids[i],
+                disabled = actions[graph.entity(id).type](id).disabled(graph);
+            if (disabled) return disabled;
+        }
+    };
+
+    return action;
+};
+// Connect the ways at the given nodes.
+//
+// The last node will survive. All other nodes will be replaced with
+// the surviving node in parent ways, and then removed.
+//
+// Tags and relation memberships of of non-surviving nodes are merged
+// to the survivor.
+//
+// This is the inverse of `iD.actions.Disconnect`.
+//
+// Reference:
+//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MergeNodesAction.as
+//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/MergeNodesAction.java
+//
+iD.actions.Connect = function(nodeIds) {
+    return function(graph) {
+        var survivor = graph.entity(_.last(nodeIds));
+
+        for (var i = 0; i < nodeIds.length - 1; i++) {
+            var node = graph.entity(nodeIds[i]);
+
+            /* eslint-disable no-loop-func */
+            graph.parentWays(node).forEach(function(parent) {
+                if (!parent.areAdjacent(node.id, survivor.id)) {
+                    graph = graph.replace(parent.replaceNode(node.id, survivor.id));
+                }
+            });
+
+            graph.parentRelations(node).forEach(function(parent) {
+                graph = graph.replace(parent.replaceMember(node, survivor));
+            });
+            /* eslint-enable no-loop-func */
+
+            survivor = survivor.mergeTags(node.tags);
+            graph = iD.actions.DeleteNode(node.id)(graph);
+        }
+
+        graph = graph.replace(survivor);
+
+        return graph;
+    };
+};
+iD.actions.Merge = function(ids) {
+    function groupEntitiesByGeometry(graph) {
+        var entities = ids.map(function(id) { return graph.entity(id); });
+        return _.extend({point: [], area: [], line: [], relation: []},
+            _.groupBy(entities, function(entity) { return entity.geometry(graph); }));
+    }
+
+    var action = function(graph) {
+        var geometries = groupEntitiesByGeometry(graph),
+            target = geometries.area[0] || geometries.line[0],
+            points = geometries.point;
+
+        points.forEach(function(point) {
+            target = target.mergeTags(point.tags);
+
+            graph.parentRelations(point).forEach(function(parent) {
+                graph = graph.replace(parent.replaceMember(point, target));
+            });
+
+            graph = graph.remove(point);
+        });
+
+        graph = graph.replace(target);
+
+        return graph;
+    };
+
+    action.disabled = function(graph) {
+        var geometries = groupEntitiesByGeometry(graph);
+        if (geometries.point.length === 0 ||
+            (geometries.area.length + geometries.line.length) !== 1 ||
+            geometries.relation.length !== 0)
+            return 'not_eligible';
+    };
+
+    return action;
+};
+/* warning!!
+ *
+ * this is still early code and tests need to be added */
+iD.actions.Slide = function(options, projection) {
+    function nodeInteresting(graph, node) {
+        return graph.parentWays(node).length > 1 ||
+            graph.parentRelations(node).length ||
+            node.hasInterestingTags();
+    }
+
+    function positionAlongWay(n, s, e) {
+        return ((n[0] - s[0]) * (e[0] - s[0]) + (n[1] - s[1]) * (e[1] - s[1]))/
+                (Math.pow(e[0] - s[0], 2) + Math.pow(e[1] - s[1], 2));
+    }
+
+    var action = function(graph) {
+        var way = options.way,
+            allNodes = options.allNodes,
+            relevantNodes = options.relevantNodes,
+            relevantStartIndex = options.relevantStartIndex,
+            relevantEndIndex = options.relevantEndIndex,
+            points = options.points,
+            closesPointIndex = [],
+            newNodes, newNodeIds, i, j;
+
+        // relevantNodes are the subset of the way is being slided.
+        // creates closesPointIndex, an injective mapping, 
+        // which foreach relevant node finds the closest new node.
+        // skips 'keyNodes' which are members of othe ways
+        var previousClosest = 0;
+        closesPointIndex.push(0);
+        for (i = 1; i < relevantNodes.length - 1; i++) {
+            var node = relevantNodes[i],
+                start = previousClosest + 1;
+
+            // member of other ways so, want keep it around the move it smartly
+            if (nodeInteresting(graph, node)) {
+                closesPointIndex.push(null);
+                continue;
+            }
+
+            var minDistIndex = null, minDist = Number.MAX_VALUE;
+            for (j = start; j < points.length - 1; j++) {
+                var dist = iD.geo.sphericalDistance(node.loc, points[j]);
+                if (dist < minDist) {
+                    minDist = dist;
+                    minDistIndex = j;
+                }
+            }
+
+            // couldn't find a closest because we have less new points than old, so delete it. 
+            // we know it's uninteresting because of check above
+            if (minDistIndex === null) {
+                graph = iD.actions.DeleteNode(node.id)(graph);
+            } else {
+                previousClosest = minDistIndex;
+            }
+
+            closesPointIndex.push(minDistIndex);
+        }
+        closesPointIndex.push(points.length-1);  // first and last don't move, thus stay the same node
+
+        // move the existing nodes and create the new ones.
+        previousClosest = 0;
+        newNodes = [relevantNodes[0]]; // first node doesn't move
+        for (i = 1; i < relevantNodes.length; i++) {
+            if (closesPointIndex[i] === null) {
+                // interesting so we do a special placement in the next loop
+                continue;
+            }
+
+            for (j = previousClosest + 1; j < closesPointIndex[i]; j++) {
+                var newNode = iD.Node({loc: points[j]});
+                newNodes.push(newNode);
+
+                graph = graph.replace(newNode);
+            }
+            previousClosest = closesPointIndex[i];
+
+            relevantNodes[i] = relevantNodes[i].move(points[closesPointIndex[i]]);
+            graph = graph.replace(relevantNodes[i]);
+
+            newNodes.push(relevantNodes[i]);
+        }
+
+        // place the key points on the best point of the new line
+        for (i = 1; i < relevantNodes.length - 1; i++) {
+            var n = relevantNodes[i];
+
+            if (closesPointIndex[i] === null && nodeInteresting(graph, n)) {
+                var result = iD.geo.chooseEdge(newNodes, projection(n.loc), projection);
+
+                n = n.move(result.loc);
+                graph = graph.replace(n);
+                if (iD.geo.sphericalDistance(newNodes[result.index - 1].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index - 1])) {
+                    graph = iD.actions.DeleteNode(newNodes[result.index - 1].id)(graph);
+                    newNodes[result.index - 1] = n;
+                } else if (iD.geo.sphericalDistance(newNodes[result.index].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index])) {
+                    graph = iD.actions.DeleteNode(newNodes[result.index].id)(graph);
+                    newNodes[result.index ] = n;
+                } else {
+                    newNodes.splice(result.index, 0, n);
+                }
+            }
+        }
+
+        // replace middle of th way  with new nodes
+        allNodes.splice.apply(allNodes, [relevantStartIndex, relevantEndIndex - relevantStartIndex + 1].concat(newNodes));
+
+        // set the complete list of node ids of the way
+        newNodeIds = allNodes.map(function(n) { return n.id; });
+        return graph.replace(way.update({nodes: newNodeIds}));
+    };
+
+    return action;
+};
 // https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/AddNodeToWayAction.as
 iD.actions.AddVertex = function(wayId, nodeId, index) {
     return function(graph) {
@@ -21557,381 +21851,135 @@ iD.actions.Split = function(nodeId, newWayIds) {
 
     return action;
 };
-// https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/command/MoveCommand.java
-// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MoveNodeAction.as
-iD.actions.Move = function(moveIds, tryDelta, projection, cache) {
-    var delta = tryDelta;
+// Join ways at the end node they share.
+//
+// This is the inverse of `iD.actions.Split`.
+//
+// Reference:
+//   https://github.com/systemed/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/MergeWaysAction.as
+//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/CombineWayAction.java
+//
+iD.actions.Join = function(ids) {
 
-    function vecAdd(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
-    function vecSub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
-
-    function setupCache(graph) {
-        function canMove(nodeId) {
-            var parents = _.pluck(graph.parentWays(graph.entity(nodeId)), 'id');
-            if (parents.length < 3) return true;
-
-            // Don't move a vertex where >2 ways meet, unless all parentWays are moving too..
-            var parentsMoving = _.all(parents, function(id) { return cache.moving[id]; });
-            if (!parentsMoving) delete cache.moving[nodeId];
-
-            return parentsMoving;
-        }
-
-        function cacheEntities(ids) {
-            _.each(ids, function(id) {
-                if (cache.moving[id]) return;
-                cache.moving[id] = true;
-
-                var entity = graph.hasEntity(id);
-                if (!entity) return;
-
-                if (entity.type === 'node') {
-                    cache.nodes.push(id);
-                    cache.startLoc[id] = entity.loc;
-                } else if (entity.type === 'way') {
-                    cache.ways.push(id);
-                    cacheEntities(entity.nodes);
-                } else {
-                    cacheEntities(_.pluck(entity.members, 'id'));
-                }
-            });
-        }
-
-        function cacheIntersections(ids) {
-            function isEndpoint(way, id) { return !way.isClosed() && !!way.affix(id); }
-
-            _.each(ids, function(id) {
-                // consider only intersections with 1 moved and 1 unmoved way.
-                _.each(graph.childNodes(graph.entity(id)), function(node) {
-                    var parents = graph.parentWays(node);
-                    if (parents.length !== 2) return;
-
-                    var moved = graph.entity(id),
-                        unmoved = _.find(parents, function(way) { return !cache.moving[way.id]; });
-                    if (!unmoved) return;
-
-                    // exclude ways that are overly connected..
-                    if (_.intersection(moved.nodes, unmoved.nodes).length > 2) return;
-
-                    if (moved.isArea() || unmoved.isArea()) return;
-
-                    cache.intersection[node.id] = {
-                        nodeId: node.id,
-                        movedId: moved.id,
-                        unmovedId: unmoved.id,
-                        movedIsEP: isEndpoint(moved, node.id),
-                        unmovedIsEP: isEndpoint(unmoved, node.id)
-                    };
-                });
-            });
-        }
-
-
-        if (!cache) {
-            cache = {};
-        }
-        if (!cache.ok) {
-            cache.moving = {};
-            cache.intersection = {};
-            cache.replacedVertex = {};
-            cache.startLoc = {};
-            cache.nodes = [];
-            cache.ways = [];
-
-            cacheEntities(moveIds);
-            cacheIntersections(cache.ways);
-            cache.nodes = _.filter(cache.nodes, canMove);
-
-            cache.ok = true;
-        }
+    function groupEntitiesByGeometry(graph) {
+        var entities = ids.map(function(id) { return graph.entity(id); });
+        return _.extend({line: []}, _.groupBy(entities, function(entity) { return entity.geometry(graph); }));
     }
-
-
-    // Place a vertex where the moved vertex used to be, to preserve way shape..
-    function replaceMovedVertex(nodeId, wayId, graph, delta) {
-        var way = graph.entity(wayId),
-            moved = graph.entity(nodeId),
-            movedIndex = way.nodes.indexOf(nodeId),
-            len, prevIndex, nextIndex;
-
-        if (way.isClosed()) {
-            len = way.nodes.length - 1;
-            prevIndex = (movedIndex + len - 1) % len;
-            nextIndex = (movedIndex + len + 1) % len;
-        } else {
-            len = way.nodes.length;
-            prevIndex = movedIndex - 1;
-            nextIndex = movedIndex + 1;
-        }
-
-        var prev = graph.hasEntity(way.nodes[prevIndex]),
-            next = graph.hasEntity(way.nodes[nextIndex]);
-
-        // Don't add orig vertex at endpoint..
-        if (!prev || !next) return graph;
-
-        var key = wayId + '_' + nodeId,
-            orig = cache.replacedVertex[key];
-        if (!orig) {
-            orig = iD.Node();
-            cache.replacedVertex[key] = orig;
-            cache.startLoc[orig.id] = cache.startLoc[nodeId];
-        }
-
-        var start, end;
-        if (delta) {
-            start = projection(cache.startLoc[nodeId]);
-            end = projection.invert(vecAdd(start, delta));
-        } else {
-            end = cache.startLoc[nodeId];
-        }
-        orig = orig.move(end);
-
-        var angle = Math.abs(iD.geo.angle(orig, prev, projection) -
-                iD.geo.angle(orig, next, projection)) * 180 / Math.PI;
-
-        // Don't add orig vertex if it would just make a straight line..
-        if (angle > 175 && angle < 185) return graph;
-
-        // Don't add orig vertex if another point is already nearby (within 10m)
-        if (iD.geo.sphericalDistance(prev.loc, orig.loc) < 10 ||
-            iD.geo.sphericalDistance(orig.loc, next.loc) < 10) return graph;
-
-        // moving forward or backward along way?
-        var p1 = [prev.loc, orig.loc, moved.loc, next.loc].map(projection),
-            p2 = [prev.loc, moved.loc, orig.loc, next.loc].map(projection),
-            d1 = iD.geo.pathLength(p1),
-            d2 = iD.geo.pathLength(p2),
-            insertAt = (d1 < d2) ? movedIndex : nextIndex;
-
-        // moving around closed loop?
-        if (way.isClosed() && insertAt === 0) insertAt = len;
-
-        way = way.addNode(orig.id, insertAt);
-        return graph.replace(orig).replace(way);
-    }
-
-    // Reorder nodes around intersections that have moved..
-    function unZorroIntersection(intersection, graph) {
-        var vertex = graph.entity(intersection.nodeId),
-            way1 = graph.entity(intersection.movedId),
-            way2 = graph.entity(intersection.unmovedId),
-            isEP1 = intersection.movedIsEP,
-            isEP2 = intersection.unmovedIsEP;
-
-        // don't move the vertex if it is the endpoint of both ways.
-        if (isEP1 && isEP2) return graph;
-
-        var nodes1 = _.without(graph.childNodes(way1), vertex),
-            nodes2 = _.without(graph.childNodes(way2), vertex);
-
-        if (way1.isClosed() && way1.first() === vertex.id) nodes1.push(nodes1[0]);
-        if (way2.isClosed() && way2.first() === vertex.id) nodes2.push(nodes2[0]);
-
-        var edge1 = !isEP1 && iD.geo.chooseEdge(nodes1, projection(vertex.loc), projection),
-            edge2 = !isEP2 && iD.geo.chooseEdge(nodes2, projection(vertex.loc), projection),
-            loc;
-
-        // snap vertex to nearest edge (or some point between them)..
-        if (!isEP1 && !isEP2) {
-            var epsilon = 1e-4, maxIter = 10;
-            for (var i = 0; i < maxIter; i++) {
-                loc = iD.geo.interp(edge1.loc, edge2.loc, 0.5);
-                edge1 = iD.geo.chooseEdge(nodes1, projection(loc), projection);
-                edge2 = iD.geo.chooseEdge(nodes2, projection(loc), projection);
-                if (Math.abs(edge1.distance - edge2.distance) < epsilon) break;
-            }
-        } else if (!isEP1) {
-            loc = edge1.loc;
-        } else {
-            loc = edge2.loc;
-        }
-
-        graph = graph.replace(vertex.move(loc));
-
-        // if zorro happened, reorder nodes..
-        if (!isEP1 && edge1.index !== way1.nodes.indexOf(vertex.id)) {
-            way1 = way1.removeNode(vertex.id).addNode(vertex.id, edge1.index);
-            graph = graph.replace(way1);
-        }
-        if (!isEP2 && edge2.index !== way2.nodes.indexOf(vertex.id)) {
-            way2 = way2.removeNode(vertex.id).addNode(vertex.id, edge2.index);
-            graph = graph.replace(way2);
-        }
-
-        return graph;
-    }
-
-
-    function cleanupIntersections(graph) {
-        _.each(cache.intersection, function(obj) {
-            graph = replaceMovedVertex(obj.nodeId, obj.movedId, graph, delta);
-            graph = replaceMovedVertex(obj.nodeId, obj.unmovedId, graph, null);
-            graph = unZorroIntersection(obj, graph);
-        });
-
-        return graph;
-    }
-
-    // check if moving way endpoint can cross an unmoved way, if so limit delta..
-    function limitDelta(graph) {
-        _.each(cache.intersection, function(obj) {
-            if (!obj.movedIsEP) return;
-
-            var node = graph.entity(obj.nodeId),
-                start = projection(node.loc),
-                end = vecAdd(start, delta),
-                movedNodes = graph.childNodes(graph.entity(obj.movedId)),
-                movedPath = _.map(_.pluck(movedNodes, 'loc'),
-                    function(loc) { return vecAdd(projection(loc), delta); }),
-                unmovedNodes = graph.childNodes(graph.entity(obj.unmovedId)),
-                unmovedPath = _.map(_.pluck(unmovedNodes, 'loc'), projection),
-                hits = iD.geo.pathIntersections(movedPath, unmovedPath);
-
-            for (var i = 0; i < hits.length; i++) {
-                if (_.isEqual(hits[i], end)) continue;
-                var edge = iD.geo.chooseEdge(unmovedNodes, end, projection);
-                delta = vecSub(projection(edge.loc), start);
-            }
-        });
-    }
-
 
     var action = function(graph) {
-        if (delta[0] === 0 && delta[1] === 0) return graph;
+        var ways = ids.map(graph.entity, graph),
+            survivor = ways[0];
 
-        setupCache(graph);
-
-        if (!_.isEmpty(cache.intersection)) {
-            limitDelta(graph);
+        // Prefer to keep an existing way.
+        for (var i = 0; i < ways.length; i++) {
+            if (!ways[i].isNew()) {
+                survivor = ways[i];
+                break;
+            }
         }
 
-        _.each(cache.nodes, function(id) {
-            var node = graph.entity(id),
-                start = projection(node.loc),
-                end = vecAdd(start, delta);
-            graph = graph.replace(node.move(projection.invert(end)));
+        var joined = iD.geo.joinWays(ways, graph)[0];
+
+        survivor = survivor.update({nodes: _.pluck(joined.nodes, 'id')});
+        graph = graph.replace(survivor);
+
+        joined.forEach(function(way) {
+            if (way.id === survivor.id)
+                return;
+
+            graph.parentRelations(way).forEach(function(parent) {
+                graph = graph.replace(parent.replaceMember(way, survivor));
+            });
+
+            survivor = survivor.mergeTags(way.tags);
+
+            graph = graph.replace(survivor);
+            graph = iD.actions.DeleteWay(way.id)(graph);
         });
-
-        if (!_.isEmpty(cache.intersection)) {
-            graph = cleanupIntersections(graph);
-        }
 
         return graph;
     };
 
     action.disabled = function(graph) {
-        function incompleteRelation(id) {
-            var entity = graph.entity(id);
-            return entity.type === 'relation' && !entity.isComplete(graph);
-        }
+        var geometries = groupEntitiesByGeometry(graph);
+        if (ids.length < 2 || ids.length !== geometries.line.length)
+            return 'not_eligible';
 
-        if (_.any(moveIds, incompleteRelation))
-            return 'incomplete_relation';
-    };
+        var joined = iD.geo.joinWays(ids.map(graph.entity, graph), graph);
+        if (joined.length > 1)
+            return 'not_adjacent';
 
-    action.delta = function() {
-        return delta;
+        var nodeIds = _.pluck(joined[0].nodes, 'id').slice(1, -1),
+            relation,
+            tags = {},
+            conflicting = false;
+
+        joined[0].forEach(function(way) {
+            var parents = graph.parentRelations(way);
+            parents.forEach(function(parent) {
+                if (parent.isRestriction() && parent.members.some(function(m) { return nodeIds.indexOf(m.id) >= 0; }))
+                    relation = parent;
+            });
+
+            for (var k in way.tags) {
+                if (!(k in tags)) {
+                    tags[k] = way.tags[k];
+                } else if (tags[k] && iD.interestingTag(k) && tags[k] !== way.tags[k]) {
+                    conflicting = true;
+                }
+            }
+        });
+
+        if (relation)
+            return 'restriction';
+
+        if (conflicting)
+            return 'conflicting_tags';
     };
 
     return action;
 };
-// Disconect the ways at the given node.
-//
-// Optionally, disconnect only the given ways.
-//
-// For testing convenience, accepts an ID to assign to the (first) new node.
-// Normally, this will be undefined and the way will automatically
-// be assigned a new ID.
-//
-// This is the inverse of `iD.actions.Connect`.
-//
-// Reference:
-//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/UnjoinNodeAction.as
-//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/UnGlueAction.java
-//
-iD.actions.Disconnect = function(nodeId, newNodeId) {
-    var wayIds;
+iD.actions.DeleteMember = function(relationId, memberIndex) {
+    return function(graph) {
+        var relation = graph.entity(relationId)
+            .removeMember(memberIndex);
 
-    var action = function(graph) {
-        var node = graph.entity(nodeId),
-            connections = action.connections(graph);
+        graph = graph.replace(relation);
 
-        connections.forEach(function(connection) {
-            var way = graph.entity(connection.wayID),
-                newNode = iD.Node({id: newNodeId, loc: node.loc, tags: node.tags});
-
-            graph = graph.replace(newNode);
-            if (connection.index === 0 && way.isArea()) {
-                // replace shared node with shared node..
-                graph = graph.replace(way.replaceNode(way.nodes[0], newNode.id));
-            } else {
-                // replace shared node with multiple new nodes..
-                graph = graph.replace(way.updateNode(newNode.id, connection.index));
-            }
-        });
+        if (relation.isDegenerate())
+            graph = iD.actions.DeleteRelation(relation.id)(graph);
 
         return graph;
     };
+};
+iD.actions.AddMember = function(relationId, member, memberIndex) {
+    return function(graph) {
+        var relation = graph.entity(relationId);
 
-    action.connections = function(graph) {
-        var candidates = [],
-            keeping = false,
-            parentWays = graph.parentWays(graph.entity(nodeId));
+        if (isNaN(memberIndex) && member.type === 'way') {
+            var members = relation.indexedMembers();
+            members.push(member);
 
-        parentWays.forEach(function(way) {
-            if (wayIds && wayIds.indexOf(way.id) === -1) {
-                keeping = true;
-                return;
-            }
-            if (way.isArea() && (way.nodes[0] === nodeId)) {
-                candidates.push({wayID: way.id, index: 0});
-            } else {
-                way.nodes.forEach(function(waynode, index) {
-                    if (waynode === nodeId) {
-                        candidates.push({wayID: way.id, index: index});
+            var joined = iD.geo.joinWays(members, graph);
+            for (var i = 0; i < joined.length; i++) {
+                var segment = joined[i];
+                for (var j = 0; j < segment.length && segment.length >= 2; j++) {
+                    if (segment[j] !== member)
+                        continue;
+
+                    if (j === 0) {
+                        memberIndex = segment[j + 1].index;
+                    } else if (j === segment.length - 1) {
+                        memberIndex = segment[j - 1].index + 1;
+                    } else {
+                        memberIndex = Math.min(segment[j - 1].index + 1, segment[j + 1].index + 1);
                     }
-                });
-            }
-        });
-
-        return keeping ? candidates : candidates.slice(1);
-    };
-
-    action.disabled = function(graph) {
-        var connections = action.connections(graph);
-        if (connections.length === 0 || (wayIds && wayIds.length !== connections.length))
-            return 'not_connected';
-
-        var parentWays = graph.parentWays(graph.entity(nodeId)),
-            seenRelationIds = {},
-            sharedRelation;
-
-        parentWays.forEach(function(way) {
-            if (wayIds && wayIds.indexOf(way.id) === -1)
-                return;
-
-            var relations = graph.parentRelations(way);
-            relations.forEach(function(relation) {
-                if (relation.id in seenRelationIds) {
-                    sharedRelation = relation;
-                } else {
-                    seenRelationIds[relation.id] = true;
                 }
-            });
-        });
+            }
+        }
 
-        if (sharedRelation)
-            return 'relation';
+        return graph.replace(relation.addMember(member, memberIndex));
     };
-
-    action.limitWays = function(_) {
-        if (!arguments.length) return wayIds;
-        wayIds = _;
-        return action;
-    };
-
-    return action;
 };
 iD.actions.Revert = function(id) {
 
@@ -22095,6 +22143,103 @@ iD.actions.Noop = function() {
         return graph;
     };
 };
+// Disconect the ways at the given node.
+//
+// Optionally, disconnect only the given ways.
+//
+// For testing convenience, accepts an ID to assign to the (first) new node.
+// Normally, this will be undefined and the way will automatically
+// be assigned a new ID.
+//
+// This is the inverse of `iD.actions.Connect`.
+//
+// Reference:
+//   https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/UnjoinNodeAction.as
+//   https://github.com/openstreetmap/josm/blob/mirror/src/org/openstreetmap/josm/actions/UnGlueAction.java
+//
+iD.actions.Disconnect = function(nodeId, newNodeId) {
+    var wayIds;
+
+    var action = function(graph) {
+        var node = graph.entity(nodeId),
+            connections = action.connections(graph);
+
+        connections.forEach(function(connection) {
+            var way = graph.entity(connection.wayID),
+                newNode = iD.Node({id: newNodeId, loc: node.loc, tags: node.tags});
+
+            graph = graph.replace(newNode);
+            if (connection.index === 0 && way.isArea()) {
+                // replace shared node with shared node..
+                graph = graph.replace(way.replaceNode(way.nodes[0], newNode.id));
+            } else {
+                // replace shared node with multiple new nodes..
+                graph = graph.replace(way.updateNode(newNode.id, connection.index));
+            }
+        });
+
+        return graph;
+    };
+
+    action.connections = function(graph) {
+        var candidates = [],
+            keeping = false,
+            parentWays = graph.parentWays(graph.entity(nodeId));
+
+        parentWays.forEach(function(way) {
+            if (wayIds && wayIds.indexOf(way.id) === -1) {
+                keeping = true;
+                return;
+            }
+            if (way.isArea() && (way.nodes[0] === nodeId)) {
+                candidates.push({wayID: way.id, index: 0});
+            } else {
+                way.nodes.forEach(function(waynode, index) {
+                    if (waynode === nodeId) {
+                        candidates.push({wayID: way.id, index: index});
+                    }
+                });
+            }
+        });
+
+        return keeping ? candidates : candidates.slice(1);
+    };
+
+    action.disabled = function(graph) {
+        var connections = action.connections(graph);
+        if (connections.length === 0 || (wayIds && wayIds.length !== connections.length))
+            return 'not_connected';
+
+        var parentWays = graph.parentWays(graph.entity(nodeId)),
+            seenRelationIds = {},
+            sharedRelation;
+
+        parentWays.forEach(function(way) {
+            if (wayIds && wayIds.indexOf(way.id) === -1)
+                return;
+
+            var relations = graph.parentRelations(way);
+            relations.forEach(function(relation) {
+                if (relation.id in seenRelationIds) {
+                    sharedRelation = relation;
+                } else {
+                    seenRelationIds[relation.id] = true;
+                }
+            });
+        });
+
+        if (sharedRelation)
+            return 'relation';
+    };
+
+    action.limitWays = function(_) {
+        if (!arguments.length) return wayIds;
+        wayIds = _;
+        return action;
+    };
+
+    return action;
+};
 iD.actions.ChangePreset = function(entityId, oldPreset, newPreset) {
     return function(graph) {
         var entity = graph.entity(entityId),
@@ -22180,128 +22325,6 @@ iD.actions.Straighten = function(wayId, projection) {
     };
 
     return action;
-};
-/* warning!!
- *
- * this is still early code and tests need to be added */
-iD.actions.Slide = function(options, projection) {
-    function nodeInteresting(graph, node) {
-        return graph.parentWays(node).length > 1 ||
-            graph.parentRelations(node).length ||
-            node.hasInterestingTags();
-    }
-
-    function positionAlongWay(n, s, e) {
-        return ((n[0] - s[0]) * (e[0] - s[0]) + (n[1] - s[1]) * (e[1] - s[1]))/
-                (Math.pow(e[0] - s[0], 2) + Math.pow(e[1] - s[1], 2));
-    }
-
-    var action = function(graph) {
-        var way = options.way,
-            allNodes = options.allNodes,
-            relevantNodes = options.relevantNodes,
-            relevantStartIndex = options.relevantStartIndex,
-            relevantEndIndex = options.relevantEndIndex,
-            points = options.points,
-            closesPointIndex = [],
-            newNodes, newNodeIds, i, j;
-
-        // relevantNodes are the subset of the way is being slided.
-        // creates closesPointIndex, an injective mapping, 
-        // which foreach relevant node finds the closest new node.
-        // skips 'keyNodes' which are members of othe ways
-        var previousClosest = 0;
-        closesPointIndex.push(0);
-        for (i = 1; i < relevantNodes.length - 1; i++) {
-            var node = relevantNodes[i],
-                start = previousClosest + 1;
-
-            // member of other ways so, want keep it around the move it smartly
-            if (nodeInteresting(graph, node)) {
-                closesPointIndex.push(null);
-                continue;
-            }
-
-            var minDistIndex = null, minDist = Number.MAX_VALUE;
-            for (j = start; j < points.length - 1; j++) {
-                var dist = iD.geo.sphericalDistance(node.loc, points[j]);
-                if (dist < minDist) {
-                    minDist = dist;
-                    minDistIndex = j;
-                }
-            }
-
-            // couldn't find a closest because we have less new points than old, so delete it. 
-            // we know it's uninteresting because of check above
-            if (minDistIndex === null) {
-                graph = iD.actions.DeleteNode(node.id)(graph);
-            } else {
-                previousClosest = minDistIndex;
-            }
-
-            closesPointIndex.push(minDistIndex);
-        }
-        closesPointIndex.push(points.length-1);  // first and last don't move, thus stay the same node
-
-        // move the existing nodes and create the new ones.
-        previousClosest = 0;
-        newNodes = [relevantNodes[0]]; // first node doesn't move
-        for (i = 1; i < relevantNodes.length; i++) {
-            if (closesPointIndex[i] === null) {
-                // interesting so we do a special placement in the next loop
-                continue;
-            }
-
-            for (j = previousClosest + 1; j < closesPointIndex[i]; j++) {
-                var newNode = iD.Node({loc: points[j]});
-                newNodes.push(newNode);
-
-                graph = graph.replace(newNode);
-            }
-            previousClosest = closesPointIndex[i];
-
-            relevantNodes[i] = relevantNodes[i].move(points[closesPointIndex[i]]);
-            graph = graph.replace(relevantNodes[i]);
-
-            newNodes.push(relevantNodes[i]);
-        }
-
-        // place the key points on the best point of the new line
-        for (i = 1; i < relevantNodes.length - 1; i++) {
-            var n = relevantNodes[i];
-
-            if (closesPointIndex[i] === null && nodeInteresting(graph, n)) {
-                var result = iD.geo.chooseEdge(newNodes, projection(n.loc), projection);
-
-                n = n.move(result.loc);
-                graph = graph.replace(n);
-                if (iD.geo.sphericalDistance(newNodes[result.index - 1].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index - 1])) {
-                    graph = iD.actions.DeleteNode(newNodes[result.index - 1].id)(graph);
-                    newNodes[result.index - 1] = n;
-                } else if (iD.geo.sphericalDistance(newNodes[result.index].loc, result.loc) < 5 && !nodeInteresting(graph, newNodes[result.index])) {
-                    graph = iD.actions.DeleteNode(newNodes[result.index].id)(graph);
-                    newNodes[result.index ] = n;
-                } else {
-                    newNodes.splice(result.index, 0, n);
-                }
-            }
-        }
-
-        // replace middle of th way  with new nodes
-        allNodes.splice.apply(allNodes, [relevantStartIndex, relevantEndIndex - relevantStartIndex + 1].concat(newNodes));
-
-        // set the complete list of node ids of the way
-        newNodeIds = allNodes.map(function(n) { return n.id; });
-        return graph.replace(way.update({nodes: newNodeIds}));
-    };
-
-    return action;
-};
-iD.actions.ChangeTags = function(entityId, tags) {
-    return function(graph) {
-        var entity = graph.entity(entityId);
-        return graph.replace(entity.update({tags: tags}));
-    };
 };
 /*
  * Based on https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/potlatch2/tools/Quadrilateralise.as
@@ -22550,34 +22573,39 @@ iD.actions.RotateWay = function(wayId, pivot, angle, projection) {
         });
     };
 };
-iD.actions.AddMember = function(relationId, member, memberIndex) {
-    return function(graph) {
-        var relation = graph.entity(relationId);
+// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/DeleteNodeAction.as
+iD.actions.DeleteNode = function(nodeId) {
+    var action = function(graph) {
+        var node = graph.entity(nodeId);
 
-        if (isNaN(memberIndex) && member.type === 'way') {
-            var members = relation.indexedMembers();
-            members.push(member);
+        graph.parentWays(node)
+            .forEach(function(parent) {
+                parent = parent.removeNode(nodeId);
+                graph = graph.replace(parent);
 
-            var joined = iD.geo.joinWays(members, graph);
-            for (var i = 0; i < joined.length; i++) {
-                var segment = joined[i];
-                for (var j = 0; j < segment.length && segment.length >= 2; j++) {
-                    if (segment[j] !== member)
-                        continue;
-
-                    if (j === 0) {
-                        memberIndex = segment[j + 1].index;
-                    } else if (j === segment.length - 1) {
-                        memberIndex = segment[j - 1].index + 1;
-                    } else {
-                        memberIndex = Math.min(segment[j - 1].index + 1, segment[j + 1].index + 1);
-                    }
+                if (parent.isDegenerate()) {
+                    graph = iD.actions.DeleteWay(parent.id)(graph);
                 }
-            }
-        }
+            });
 
-        return graph.replace(relation.addMember(member, memberIndex));
+        graph.parentRelations(node)
+            .forEach(function(parent) {
+                parent = parent.removeMembersWithID(nodeId);
+                graph = graph.replace(parent);
+
+                if (parent.isDegenerate()) {
+                    graph = iD.actions.DeleteRelation(parent.id)(graph);
+                }
+            });
+
+        return graph.remove(node);
     };
+
+    action.disabled = function() {
+        return false;
+    };
+
+    return action;
 };
 /*
   Order the nodes of a way in reverse order and reverse any direction dependent tags
@@ -22668,39 +22696,11 @@ iD.actions.Reverse = function(wayId, options) {
         return graph.replace(way.update({nodes: nodes, tags: tags}));
     };
 };
-// https://github.com/openstreetmap/potlatch2/blob/master/net/systemeD/halcyon/connection/actions/DeleteNodeAction.as
-iD.actions.DeleteNode = function(nodeId) {
-    var action = function(graph) {
-        var node = graph.entity(nodeId);
-
-        graph.parentWays(node)
-            .forEach(function(parent) {
-                parent = parent.removeNode(nodeId);
-                graph = graph.replace(parent);
-
-                if (parent.isDegenerate()) {
-                    graph = iD.actions.DeleteWay(parent.id)(graph);
-                }
-            });
-
-        graph.parentRelations(node)
-            .forEach(function(parent) {
-                parent = parent.removeMembersWithID(nodeId);
-                graph = graph.replace(parent);
-
-                if (parent.isDegenerate()) {
-                    graph = iD.actions.DeleteRelation(parent.id)(graph);
-                }
-            });
-
-        return graph.remove(node);
+iD.actions.ChangeTags = function(entityId, tags) {
+    return function(graph) {
+        var entity = graph.entity(entityId);
+        return graph.replace(entity.update({tags: tags}));
     };
-
-    action.disabled = function() {
-        return false;
-    };
-
-    return action;
 };
 iD.actions.CopyEntity = function(id, fromGraph, deep) {
     var newEntities = [];
@@ -22837,153 +22837,207 @@ iD.behavior.Select = function(context) {
 
     return behavior;
 };
-iD.behavior.Draw = function(context) {
-    var event = d3.dispatch('move', 'click', 'clickWay',
-            'clickNode', 'undo', 'cancel', 'finish'),
-        keybinding = d3.keybinding('draw'),
-        hover = iD.behavior.Hover(context)
-            .altDisables(true)
-            .on('hover', context.ui().sidebar.hover),
-        tail = iD.behavior.Tail(),
-        edit = iD.behavior.Edit(context),
-        closeTolerance = 4,
-        tolerance = 12;
+/*
+    `iD.behavior.drag` is like `d3.behavior.drag`, with the following differences:
 
-    function datum() {
-        if (d3.event.altKey) return {};
-        else return d3.event.target.__data__ || {};
+    * The `origin` function is expected to return an [x, y] tuple rather than an
+      {x, y} object.
+    * The events are `start`, `move`, and `end`.
+      (https://github.com/mbostock/d3/issues/563)
+    * The `start` event is not dispatched until the first cursor movement occurs.
+      (https://github.com/mbostock/d3/pull/368)
+    * The `move` event has a `point` and `delta` [x, y] tuple properties rather
+      than `x`, `y`, `dx`, and `dy` properties.
+    * The `end` event is not dispatched if no movement occurs.
+    * An `off` function is available that unbinds the drag's internal event handlers.
+    * Delegation is supported via the `delegate` function.
+
+ */
+iD.behavior.drag = function() {
+    function d3_eventCancel() {
+      d3.event.stopPropagation();
+      d3.event.preventDefault();
     }
 
+    var event = d3.dispatch('start', 'move', 'end'),
+        origin = null,
+        selector = '',
+        filter = null,
+        event_, target, surface;
+
+    event.of = function(thiz, argumentz) {
+      return function(e1) {
+        var e0 = e1.sourceEvent = d3.event;
+        e1.target = drag;
+        d3.event = e1;
+        try {
+          event[e1.type].apply(thiz, argumentz);
+        } finally {
+          d3.event = e0;
+        }
+      };
+    };
+
+    var d3_event_userSelectProperty = iD.util.prefixCSSProperty('UserSelect'),
+        d3_event_userSelectSuppress = d3_event_userSelectProperty ?
+            function () {
+                var selection = d3.selection(),
+                    select = selection.style(d3_event_userSelectProperty);
+                selection.style(d3_event_userSelectProperty, 'none');
+                return function () {
+                    selection.style(d3_event_userSelectProperty, select);
+                };
+            } :
+            function (type) {
+                var w = d3.select(window).on('selectstart.' + type, d3_eventCancel);
+                return function () {
+                    w.on('selectstart.' + type, null);
+                };
+            };
+
     function mousedown() {
+        target = this;
+        event_ = event.of(target, arguments);
+        var eventTarget = d3.event.target,
+            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
+            offset,
+            origin_ = point(),
+            started = false,
+            selectEnable = d3_event_userSelectSuppress(touchId !== null ? 'drag-' + touchId : 'drag');
+
+        var w = d3.select(window)
+            .on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', dragmove)
+            .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', dragend, true);
+
+        if (origin) {
+            offset = origin.apply(target, arguments);
+            offset = [offset[0] - origin_[0], offset[1] - origin_[1]];
+        } else {
+            offset = [0, 0];
+        }
+
+        if (touchId === null) d3.event.stopPropagation();
 
         function point() {
-            var p = context.container().node();
+            var p = target.parentNode || surface;
             return touchId !== null ? d3.touches(p).filter(function(p) {
                 return p.identifier === touchId;
             })[0] : d3.mouse(p);
         }
 
-        var element = d3.select(this),
-            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
-            t1 = +new Date(),
-            p1 = point();
+        function dragmove() {
 
-        element.on('mousemove.draw', null);
+            var p = point(),
+                dx = p[0] - origin_[0],
+                dy = p[1] - origin_[1];
+            
+            if (dx === 0 && dy === 0)
+                return;
 
-        d3.select(window).on('mouseup.draw', function() {
-            var t2 = +new Date(),
-                p2 = point(),
-                dist = iD.geo.euclideanDistance(p1, p2);
-
-            element.on('mousemove.draw', mousemove);
-            d3.select(window).on('mouseup.draw', null);
-
-            if (dist < closeTolerance || (dist < tolerance && (t2 - t1) < 500)) {
-                // Prevent a quick second click
-                d3.select(window).on('click.draw-block', function() {
-                    d3.event.stopPropagation();
-                }, true);
-
-                context.map().dblclickEnable(false);
-
-                window.setTimeout(function() {
-                    context.map().dblclickEnable(true);
-                    d3.select(window).on('click.draw-block', null);
-                }, 500);
-
-                click();
+            if (!started) {
+                started = true;
+                event_({
+                    type: 'start'
+                });
             }
-        });
-    }
 
-    function mousemove() {
-        event.move(datum());
-    }
+            origin_ = p;
+            d3_eventCancel();
 
-    function click() {
-        var d = datum();
-        if (d.type === 'way') {
-            var choice = iD.geo.chooseEdge(context.childNodes(d), context.mouse(), context.projection),
-                edge = [d.nodes[choice.index - 1], d.nodes[choice.index]];
-            event.clickWay(choice.loc, edge);
+            event_({
+                type: 'move',
+                point: [p[0] + offset[0],  p[1] + offset[1]],
+                delta: [dx, dy]
+            });
+        }
 
-        } else if (d.type === 'node') {
-            event.clickNode(d);
+        function dragend() {
+            if (started) {
+                event_({
+                    type: 'end'
+                });
 
-        } else {
-            event.click(context.map().mouseCoordinates());
+                d3_eventCancel();
+                if (d3.event.target === eventTarget) w.on('click.drag', click, true);
+            }
+
+            w.on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', null)
+                .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', null);
+            selectEnable();
+        }
+
+        function click() {
+            d3_eventCancel();
+            w.on('click.drag', null);
         }
     }
 
-    function backspace() {
-        d3.event.preventDefault();
-        event.undo();
-    }
+    function drag(selection) {
+        var matchesSelector = iD.util.prefixDOMProperty('matchesSelector'),
+            delegate = mousedown;
 
-    function del() {
-        d3.event.preventDefault();
-        event.cancel();
-    }
-
-    function ret() {
-        d3.event.preventDefault();
-        event.finish();
-    }
-
-    function draw(selection) {
-        context.install(hover);
-        context.install(edit);
-
-        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
-            context.install(tail);
+        if (selector) {
+            delegate = function() {
+                var root = this,
+                    target = d3.event.target;
+                for (; target && target !== root; target = target.parentNode) {
+                    if (target[matchesSelector](selector) &&
+                            (!filter || filter(target.__data__))) {
+                        return mousedown.call(target, target.__data__);
+                    }
+                }
+            };
         }
 
-        keybinding
-            .on('⌫', backspace)
-            .on('⌦', del)
-            .on('⎋', ret)
-            .on('↩', ret);
-
-        selection
-            .on('mousedown.draw', mousedown)
-            .on('mousemove.draw', mousemove);
-
-        d3.select(document)
-            .call(keybinding);
-
-        return draw;
+        selection.on('mousedown.drag' + selector, delegate)
+            .on('touchstart.drag' + selector, delegate);
     }
 
-    draw.off = function(selection) {
-        context.ui().sidebar.hover.cancel();
-        context.uninstall(hover);
-        context.uninstall(edit);
+    drag.off = function(selection) {
+        selection.on('mousedown.drag' + selector, null)
+            .on('touchstart.drag' + selector, null);
+    };
 
-        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
-            context.uninstall(tail);
-            iD.behavior.Draw.usedTails[tail.text()] = true;
-        }
+    drag.delegate = function(_) {
+        if (!arguments.length) return selector;
+        selector = _;
+        return drag;
+    };
 
-        selection
-            .on('mousedown.draw', null)
-            .on('mousemove.draw', null);
+    drag.filter = function(_) {
+        if (!arguments.length) return origin;
+        filter = _;
+        return drag;
+    };
 
+    drag.origin = function (_) {
+        if (!arguments.length) return origin;
+        origin = _;
+        return drag;
+    };
+
+    drag.cancel = function() {
         d3.select(window)
-            .on('mouseup.draw', null);
-
-        d3.select(document)
-            .call(keybinding.off);
+            .on('mousemove.drag', null)
+            .on('mouseup.drag', null);
+        return drag;
     };
 
-    draw.tail = function(_) {
-        tail.text(_);
-        return draw;
+    drag.target = function() {
+        if (!arguments.length) return target;
+        target = arguments[0];
+        event_ = event.of(target, Array.prototype.slice.call(arguments, 1));
+        return drag;
     };
 
-    return d3.rebind(draw, event, 'on');
+    drag.surface = function() {
+        if (!arguments.length) return surface;
+        surface = arguments[0];
+        return drag;
+    };
+
+    return d3.rebind(drag, event, 'on');
 };
-
-iD.behavior.Draw.usedTails = {};
 iD.behavior.Breathe = function() {
     var duration = 800,
         selector = '.selected.shadow, .selected .shadow',
@@ -23364,207 +23418,153 @@ iD.behavior.Lasso = function(context) {
 
     return behavior;
 };
-/*
-    `iD.behavior.drag` is like `d3.behavior.drag`, with the following differences:
+iD.behavior.Draw = function(context) {
+    var event = d3.dispatch('move', 'click', 'clickWay',
+            'clickNode', 'undo', 'cancel', 'finish'),
+        keybinding = d3.keybinding('draw'),
+        hover = iD.behavior.Hover(context)
+            .altDisables(true)
+            .on('hover', context.ui().sidebar.hover),
+        tail = iD.behavior.Tail(),
+        edit = iD.behavior.Edit(context),
+        closeTolerance = 4,
+        tolerance = 12;
 
-    * The `origin` function is expected to return an [x, y] tuple rather than an
-      {x, y} object.
-    * The events are `start`, `move`, and `end`.
-      (https://github.com/mbostock/d3/issues/563)
-    * The `start` event is not dispatched until the first cursor movement occurs.
-      (https://github.com/mbostock/d3/pull/368)
-    * The `move` event has a `point` and `delta` [x, y] tuple properties rather
-      than `x`, `y`, `dx`, and `dy` properties.
-    * The `end` event is not dispatched if no movement occurs.
-    * An `off` function is available that unbinds the drag's internal event handlers.
-    * Delegation is supported via the `delegate` function.
-
- */
-iD.behavior.drag = function() {
-    function d3_eventCancel() {
-      d3.event.stopPropagation();
-      d3.event.preventDefault();
+    function datum() {
+        if (d3.event.altKey) return {};
+        else return d3.event.target.__data__ || {};
     }
 
-    var event = d3.dispatch('start', 'move', 'end'),
-        origin = null,
-        selector = '',
-        filter = null,
-        event_, target, surface;
-
-    event.of = function(thiz, argumentz) {
-      return function(e1) {
-        var e0 = e1.sourceEvent = d3.event;
-        e1.target = drag;
-        d3.event = e1;
-        try {
-          event[e1.type].apply(thiz, argumentz);
-        } finally {
-          d3.event = e0;
-        }
-      };
-    };
-
-    var d3_event_userSelectProperty = iD.util.prefixCSSProperty('UserSelect'),
-        d3_event_userSelectSuppress = d3_event_userSelectProperty ?
-            function () {
-                var selection = d3.selection(),
-                    select = selection.style(d3_event_userSelectProperty);
-                selection.style(d3_event_userSelectProperty, 'none');
-                return function () {
-                    selection.style(d3_event_userSelectProperty, select);
-                };
-            } :
-            function (type) {
-                var w = d3.select(window).on('selectstart.' + type, d3_eventCancel);
-                return function () {
-                    w.on('selectstart.' + type, null);
-                };
-            };
-
     function mousedown() {
-        target = this;
-        event_ = event.of(target, arguments);
-        var eventTarget = d3.event.target,
-            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
-            offset,
-            origin_ = point(),
-            started = false,
-            selectEnable = d3_event_userSelectSuppress(touchId !== null ? 'drag-' + touchId : 'drag');
-
-        var w = d3.select(window)
-            .on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', dragmove)
-            .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', dragend, true);
-
-        if (origin) {
-            offset = origin.apply(target, arguments);
-            offset = [offset[0] - origin_[0], offset[1] - origin_[1]];
-        } else {
-            offset = [0, 0];
-        }
-
-        if (touchId === null) d3.event.stopPropagation();
 
         function point() {
-            var p = target.parentNode || surface;
+            var p = context.container().node();
             return touchId !== null ? d3.touches(p).filter(function(p) {
                 return p.identifier === touchId;
             })[0] : d3.mouse(p);
         }
 
-        function dragmove() {
+        var element = d3.select(this),
+            touchId = d3.event.touches ? d3.event.changedTouches[0].identifier : null,
+            t1 = +new Date(),
+            p1 = point();
 
-            var p = point(),
-                dx = p[0] - origin_[0],
-                dy = p[1] - origin_[1];
-            
-            if (dx === 0 && dy === 0)
-                return;
+        element.on('mousemove.draw', null);
 
-            if (!started) {
-                started = true;
-                event_({
-                    type: 'start'
-                });
+        d3.select(window).on('mouseup.draw', function() {
+            var t2 = +new Date(),
+                p2 = point(),
+                dist = iD.geo.euclideanDistance(p1, p2);
+
+            element.on('mousemove.draw', mousemove);
+            d3.select(window).on('mouseup.draw', null);
+
+            if (dist < closeTolerance || (dist < tolerance && (t2 - t1) < 500)) {
+                // Prevent a quick second click
+                d3.select(window).on('click.draw-block', function() {
+                    d3.event.stopPropagation();
+                }, true);
+
+                context.map().dblclickEnable(false);
+
+                window.setTimeout(function() {
+                    context.map().dblclickEnable(true);
+                    d3.select(window).on('click.draw-block', null);
+                }, 500);
+
+                click();
             }
+        });
+    }
 
-            origin_ = p;
-            d3_eventCancel();
+    function mousemove() {
+        event.move(datum());
+    }
 
-            event_({
-                type: 'move',
-                point: [p[0] + offset[0],  p[1] + offset[1]],
-                delta: [dx, dy]
-            });
-        }
+    function click() {
+        var d = datum();
+        if (d.type === 'way') {
+            var choice = iD.geo.chooseEdge(context.childNodes(d), context.mouse(), context.projection),
+                edge = [d.nodes[choice.index - 1], d.nodes[choice.index]];
+            event.clickWay(choice.loc, edge);
 
-        function dragend() {
-            if (started) {
-                event_({
-                    type: 'end'
-                });
+        } else if (d.type === 'node') {
+            event.clickNode(d);
 
-                d3_eventCancel();
-                if (d3.event.target === eventTarget) w.on('click.drag', click, true);
-            }
-
-            w.on(touchId !== null ? 'touchmove.drag-' + touchId : 'mousemove.drag', null)
-                .on(touchId !== null ? 'touchend.drag-' + touchId : 'mouseup.drag', null);
-            selectEnable();
-        }
-
-        function click() {
-            d3_eventCancel();
-            w.on('click.drag', null);
+        } else {
+            event.click(context.map().mouseCoordinates());
         }
     }
 
-    function drag(selection) {
-        var matchesSelector = iD.util.prefixDOMProperty('matchesSelector'),
-            delegate = mousedown;
-
-        if (selector) {
-            delegate = function() {
-                var root = this,
-                    target = d3.event.target;
-                for (; target && target !== root; target = target.parentNode) {
-                    if (target[matchesSelector](selector) &&
-                            (!filter || filter(target.__data__))) {
-                        return mousedown.call(target, target.__data__);
-                    }
-                }
-            };
-        }
-
-        selection.on('mousedown.drag' + selector, delegate)
-            .on('touchstart.drag' + selector, delegate);
+    function backspace() {
+        d3.event.preventDefault();
+        event.undo();
     }
 
-    drag.off = function(selection) {
-        selection.on('mousedown.drag' + selector, null)
-            .on('touchstart.drag' + selector, null);
-    };
+    function del() {
+        d3.event.preventDefault();
+        event.cancel();
+    }
 
-    drag.delegate = function(_) {
-        if (!arguments.length) return selector;
-        selector = _;
-        return drag;
-    };
+    function ret() {
+        d3.event.preventDefault();
+        event.finish();
+    }
 
-    drag.filter = function(_) {
-        if (!arguments.length) return origin;
-        filter = _;
-        return drag;
-    };
+    function draw(selection) {
+        context.install(hover);
+        context.install(edit);
 
-    drag.origin = function (_) {
-        if (!arguments.length) return origin;
-        origin = _;
-        return drag;
-    };
+        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
+            context.install(tail);
+        }
 
-    drag.cancel = function() {
+        keybinding
+            .on('⌫', backspace)
+            .on('⌦', del)
+            .on('⎋', ret)
+            .on('↩', ret);
+
+        selection
+            .on('mousedown.draw', mousedown)
+            .on('mousemove.draw', mousemove);
+
+        d3.select(document)
+            .call(keybinding);
+
+        return draw;
+    }
+
+    draw.off = function(selection) {
+        context.ui().sidebar.hover.cancel();
+        context.uninstall(hover);
+        context.uninstall(edit);
+
+        if (!context.inIntro() && !iD.behavior.Draw.usedTails[tail.text()]) {
+            context.uninstall(tail);
+            iD.behavior.Draw.usedTails[tail.text()] = true;
+        }
+
+        selection
+            .on('mousedown.draw', null)
+            .on('mousemove.draw', null);
+
         d3.select(window)
-            .on('mousemove.drag', null)
-            .on('mouseup.drag', null);
-        return drag;
+            .on('mouseup.draw', null);
+
+        d3.select(document)
+            .call(keybinding.off);
     };
 
-    drag.target = function() {
-        if (!arguments.length) return target;
-        target = arguments[0];
-        event_ = event.of(target, Array.prototype.slice.call(arguments, 1));
-        return drag;
+    draw.tail = function(_) {
+        tail.text(_);
+        return draw;
     };
 
-    drag.surface = function() {
-        if (!arguments.length) return surface;
-        surface = arguments[0];
-        return drag;
-    };
-
-    return d3.rebind(drag, event, 'on');
+    return d3.rebind(draw, event, 'on');
 };
+
+iD.behavior.Draw.usedTails = {};
 iD.behavior.Copy = function(context) {
     var keybinding = d3.keybinding('copy');
 
@@ -25786,6 +25786,48 @@ iD.operations.Move = function(selectedIDs, context) {
 
     return operation;
 };
+iD.operations.Orthogonalize = function(selectedIDs, context) {
+    var entityId = selectedIDs[0],
+        entity = context.entity(entityId),
+        extent = entity.extent(context.graph()),
+        geometry = context.geometry(entityId),
+        action = iD.actions.Orthogonalize(entityId, context.projection);
+
+    var operation = function() {
+        var annotation = t('operations.orthogonalize.annotation.' + geometry);
+        context.perform(action, annotation);
+    };
+
+    operation.available = function() {
+        return selectedIDs.length === 1 &&
+            entity.type === 'way' &&
+            entity.isClosed() &&
+            _.uniq(entity.nodes).length > 2;
+    };
+
+    operation.disabled = function() {
+        var reason;
+        if (extent.percentContainedIn(context.extent()) < 0.8) {
+            reason = 'too_large';
+        } else if (context.hasHiddenConnections(entityId)) {
+            reason = 'connected_to_hidden';
+        }
+        return action.disabled(context.graph()) || reason;
+    };
+
+    operation.tooltip = function() {
+        var disable = operation.disabled();
+        return disable ?
+            t('operations.orthogonalize.' + disable) :
+            t('operations.orthogonalize.description.' + geometry);
+    };
+
+    operation.id = 'orthogonalize';
+    operation.keys = [t('operations.orthogonalize.key')];
+    operation.title = t('operations.orthogonalize.title');
+
+    return operation;
+};
 iD.operations.Disconnect = function(selectedIDs, context) {
     var vertices = _.filter(selectedIDs, function vertex(entityId) {
         return context.geometry(entityId) === 'vertex';
@@ -25906,48 +25948,6 @@ iD.operations.Straighten = function(selectedIDs, context) {
     operation.id = 'straighten';
     operation.keys = [t('operations.straighten.key')];
     operation.title = t('operations.straighten.title');
-
-    return operation;
-};
-iD.operations.Orthogonalize = function(selectedIDs, context) {
-    var entityId = selectedIDs[0],
-        entity = context.entity(entityId),
-        extent = entity.extent(context.graph()),
-        geometry = context.geometry(entityId),
-        action = iD.actions.Orthogonalize(entityId, context.projection);
-
-    var operation = function() {
-        var annotation = t('operations.orthogonalize.annotation.' + geometry);
-        context.perform(action, annotation);
-    };
-
-    operation.available = function() {
-        return selectedIDs.length === 1 &&
-            entity.type === 'way' &&
-            entity.isClosed() &&
-            _.uniq(entity.nodes).length > 2;
-    };
-
-    operation.disabled = function() {
-        var reason;
-        if (extent.percentContainedIn(context.extent()) < 0.8) {
-            reason = 'too_large';
-        } else if (context.hasHiddenConnections(entityId)) {
-            reason = 'connected_to_hidden';
-        }
-        return action.disabled(context.graph()) || reason;
-    };
-
-    operation.tooltip = function() {
-        var disable = operation.disabled();
-        return disable ?
-            t('operations.orthogonalize.' + disable) :
-            t('operations.orthogonalize.description.' + geometry);
-    };
-
-    operation.id = 'orthogonalize';
-    operation.keys = [t('operations.orthogonalize.key')];
-    operation.title = t('operations.orthogonalize.title');
 
     return operation;
 };
@@ -31901,70 +31901,153 @@ iD.ui.FullScreen = function(context) {
             .call(keybinding);
     };
 };
-iD.ui.UndoRedo = function(context) {
-    var commands = [{
-        id: 'undo',
-        cmd: iD.ui.cmd('⌘Z'),
-        action: function() { if (!(context.inIntro() || saving())) context.undo(); },
-        annotation: function() { return context.history().undoAnnotation(); }
-    }, {
-        id: 'redo',
-        cmd: iD.ui.cmd('⌘⇧Z'),
-        action: function() {if (!(context.inIntro() || saving())) context.redo(); },
-        annotation: function() { return context.history().redoAnnotation(); }
-    }];
+iD.ui.Sidebar = function(context) {
+    var inspector = iD.ui.Inspector(context),
+        current;
 
-    function saving() {
-        return context.mode().id === 'save';
+    function sidebar(selection) {
+        var text = '<img src="https://strava.github.io/api/images/logo.png" style="height: 24px">';
+        text += '<div style="float:right; font-weight: bold; margin-top: 3px">Includes the <a href="http://labs.strava.com/slide" target="_blank">Slide add-on</a> &nbsp; </div>';
+        selection.append('div')
+            .style({position: 'absolute', 'z-index': 1000, width: '400px'})
+            .html(text);
+
+        var featureListWrap = selection.append('div')
+            .attr('class', 'feature-list-pane')
+            .call(iD.ui.FeatureList(context));
+
+        selection.call(iD.ui.Notice(context));
+
+        var inspectorWrap = selection.append('div')
+            .attr('class', 'inspector-hidden inspector-wrap fr');
+
+        function hover(id) {
+            if (!current && context.hasEntity(id)) {
+                featureListWrap.classed('inspector-hidden', true);
+                inspectorWrap.classed('inspector-hidden', false)
+                    .classed('inspector-hover', true);
+
+                if (inspector.entityID() !== id || inspector.state() !== 'hover') {
+                    inspector
+                        .state('hover')
+                        .entityID(id);
+
+                    inspectorWrap.call(inspector);
+                }
+            } else if (!current) {
+                featureListWrap.classed('inspector-hidden', false);
+                inspectorWrap.classed('inspector-hidden', true);
+                inspector.state('hide');
+            }
+        }
+
+        sidebar.hover = _.throttle(hover, 200);
+
+        sidebar.select = function(id, newFeature) {
+            if (!current && id) {
+                featureListWrap.classed('inspector-hidden', true);
+                inspectorWrap.classed('inspector-hidden', false)
+                    .classed('inspector-hover', false);
+
+                if (inspector.entityID() !== id || inspector.state() !== 'select') {
+                    inspector
+                        .state('select')
+                        .entityID(id)
+                        .newFeature(newFeature);
+
+                    inspectorWrap.call(inspector);
+                }
+            } else if (!current) {
+                featureListWrap.classed('inspector-hidden', false);
+                inspectorWrap.classed('inspector-hidden', true);
+                inspector.state('hide');
+            }
+        };
+
+        sidebar.show = function(component) {
+            featureListWrap.classed('inspector-hidden', true);
+            inspectorWrap.classed('inspector-hidden', true);
+            if (current) current.remove();
+            current = selection.append('div')
+                .attr('class', 'sidebar-component')
+                .call(component);
+        };
+
+        sidebar.hide = function() {
+            featureListWrap.classed('inspector-hidden', false);
+            inspectorWrap.classed('inspector-hidden', true);
+            if (current) current.remove();
+            current = null;
+        };
     }
 
-    return function(selection) {
-        var tooltip = bootstrap.tooltip()
-            .placement('bottom')
-            .html(true)
-            .title(function (d) {
-                return iD.ui.tooltipHtml(d.annotation() ?
-                    t(d.id + '.tooltip', {action: d.annotation()}) :
-                    t(d.id + '.nothing'), d.cmd);
-            });
+    sidebar.hover = function() {};
+    sidebar.hover.cancel = function() {};
+    sidebar.select = function() {};
+    sidebar.show = function() {};
+    sidebar.hide = function() {};
 
-        var buttons = selection.selectAll('button')
-            .data(commands)
-            .enter().append('button')
-            .attr('class', 'col6 disabled')
-            .on('click', function(d) { return d.action(); })
-            .call(tooltip);
+    return sidebar;
+};
+iD.ui.modal = function(selection, blocking) {
 
-        buttons.each(function(d) {
-            d3.select(this)
-                .call(iD.svg.Icon('#icon-' + d.id));
+    var previous = selection.select('div.modal');
+    var animate = previous.empty();
+
+    previous.transition()
+        .duration(200)
+        .style('opacity', 0)
+        .remove();
+
+    var shaded = selection
+        .append('div')
+        .attr('class', 'shaded')
+        .style('opacity', 0);
+
+    shaded.close = function() {
+        shaded
+            .transition()
+            .duration(200)
+            .style('opacity',0)
+            .remove();
+        modal
+            .transition()
+            .duration(200)
+            .style('top','0px');
+        keybinding.off();
+    };
+
+    var keybinding = d3.keybinding('modal')
+        .on('⌫', shaded.close)
+        .on('⎋', shaded.close);
+
+    d3.select(document).call(keybinding);
+
+    var modal = shaded.append('div')
+        .attr('class', 'modal fillL col6');
+
+        shaded.on('click.remove-modal', function() {
+            if (d3.event.target === this && !blocking) shaded.close();
         });
 
-        var keybinding = d3.keybinding('undo')
-            .on(commands[0].cmd, function() { d3.event.preventDefault(); commands[0].action(); })
-            .on(commands[1].cmd, function() { d3.event.preventDefault(); commands[1].action(); });
+    modal.append('button')
+        .attr('class', 'close')
+        .on('click', function() {
+            if (!blocking) shaded.close();
+        })
+        .append('div')
+            .attr('class','icon close');
 
-        d3.select(document)
-            .call(keybinding);
+    modal.append('div')
+        .attr('class', 'content');
 
-        context.history()
-            .on('change.undo_redo', update);
+    if (animate) {
+        shaded.transition().style('opacity', 1);
+    } else {
+        shaded.style('opacity', 1);
+    }
 
-        context
-            .on('enter.undo_redo', update);
-
-        function update() {
-            buttons
-                .property('disabled', saving())
-                .classed('disabled', function(d) { return !d.annotation(); })
-                .each(function() {
-                    var selection = d3.select(this);
-                    if (selection.property('tooltipVisible')) {
-                        selection.call(tooltip.show);
-                    }
-                });
-        }
-    };
+    return shaded;
 };
 iD.ui.RawTagEditor = function(context) {
     var event = d3.dispatch('change'),
@@ -32215,220 +32298,120 @@ iD.ui.RawTagEditor = function(context) {
 
     return d3.rebind(rawTagEditor, event, 'on');
 };
-iD.ui.intro = function(context) {
-    var step;
+iD.ui.SelectionList = function(context, selectedIDs) {
 
-    function intro(selection) {
+    function selectEntity(entity) {
+        context.enter(iD.modes.Select(context, [entity.id]).suppressMenu(true));
+    }
 
-        function localizedName(id) {
-            var features = {
-                n2140018997: 'city_hall',
-                n367813436: 'fire_department',
-                w203988286: 'memory_isle_park',
-                w203972937: 'riverwalk_trail',
-                w203972938: 'riverwalk_trail',
-                w203972940: 'riverwalk_trail',
-                w41785752: 'w_michigan_ave',
-                w134150789: 'w_michigan_ave',
-                w134150795: 'w_michigan_ave',
-                w134150800: 'w_michigan_ave',
-                w134150811: 'w_michigan_ave',
-                w134150802: 'e_michigan_ave',
-                w134150836: 'e_michigan_ave',
-                w41074896: 'e_michigan_ave',
-                w17965834: 'spring_st',
-                w203986457: 'scidmore_park',
-                w203049587: 'petting_zoo',
-                w17967397: 'n_andrews_st',
-                w17967315: 's_andrews_st',
-                w17967326: 'n_constantine_st',
-                w17966400: 's_constantine_st',
-                w170848823: 'rocky_river',
-                w170848824: 'rocky_river',
-                w170848331: 'rocky_river',
-                w17967752: 'railroad_dr',
-                w17965998: 'conrail_rr',
-                w134150845: 'conrail_rr',
-                w170989131: 'st_joseph_river',
-                w143497377: 'n_main_st',
-                w134150801: 's_main_st',
-                w134150830: 's_main_st',
-                w17966462: 's_main_st',
-                w17967734: 'water_st',
-                w17964996: 'foster_st',
-                w170848330: 'portage_river',
-                w17965351: 'flower_st',
-                w17965502: 'elm_st',
-                w17965402: 'walnut_st',
-                w17964793: 'morris_ave',
-                w17967444: 'east_st',
-                w17966984: 'portage_ave'
-            };
-            return features[id] && t('intro.graph.' + features[id]);
-        }
 
-        context.enter(iD.modes.Browse(context));
+    function selectionList(selection) {
+        selection.classed('selection-list-pane', true);
 
-        // Save current map state
-        var history = context.history().toJSON(),
-            hash = window.location.hash,
-            center = context.map().center(),
-            zoom = context.map().zoom(),
-            background = context.background().baseLayerSource(),
-            opacity = d3.select('.background-layer').style('opacity'),
-            loadedTiles = context.connection().loadedTiles(),
-            baseEntities = context.history().graph().base().entities,
-            introGraph, name;
+        var header = selection.append('div')
+            .attr('class', 'header fillL cf');
 
-        // Block saving
-        context.inIntro(true);
+        header.append('h3')
+            .text(t('inspector.multiselect'));
 
-        // Load semi-real data used in intro
-        context.connection().toggle(false).flush();
-        context.history().reset();
+        var listWrap = selection.append('div')
+            .attr('class', 'inspector-body');
 
-        introGraph = JSON.parse(iD.introGraph);
-        for (var key in introGraph) {
-            introGraph[key] = iD.Entity(introGraph[key]);
-            name = localizedName(key);
-            if (name) {
-                introGraph[key].tags.name = name;
-            }
-        }
-        context.history().merge(d3.values(iD.Graph().load(introGraph).entities));
-        context.background().bing();
+        var list = listWrap.append('div')
+            .attr('class', 'feature-list cf');
 
-        d3.select('.background-layer').style('opacity', 1);
+        context.history().on('change.selection-list', drawList);
+        drawList();
 
-        var curtain = d3.curtain();
-        selection.call(curtain);
+        function drawList() {
+            var entities = selectedIDs
+                .map(function(id) { return context.hasEntity(id); })
+                .filter(function(entity) { return entity; });
 
-        function reveal(box, text, options) {
-            options = options || {};
-            if (text) curtain.reveal(box, text, options.tooltipClass, options.duration);
-            else curtain.reveal(box, '', '', options.duration);
-        }
+            var items = list.selectAll('.feature-list-item')
+                .data(entities, iD.Entity.key);
 
-        var steps = ['navigation', 'point', 'area', 'line', 'startEditing'].map(function(step, i) {
-            var s = iD.ui.intro[step](context, reveal)
-                .on('done', function() {
-                    entered.filter(function(d) {
-                        return d.title === s.title;
-                    }).classed('finished', true);
-                    enter(steps[i + 1]);
+            var enter = items.enter().append('button')
+                .attr('class', 'feature-list-item')
+                .on('click', selectEntity);
+
+            // Enter
+            var label = enter.append('div')
+                .attr('class', 'label')
+                .call(iD.svg.Icon('', 'pre-text'));
+
+            label.append('span')
+                .attr('class', 'entity-type');
+
+            label.append('span')
+                .attr('class', 'entity-name');
+
+            // Update
+            items.selectAll('use')
+                .attr('href', function() {
+                    var entity = this.parentNode.parentNode.__data__;
+                    return '#icon-' + context.geometry(entity.id);
                 });
-            return s;
-        });
 
-        steps[steps.length - 1].on('startEditing', function() {
-            curtain.remove();
-            navwrap.remove();
-            d3.select('.background-layer').style('opacity', opacity);
-            context.connection().toggle(true).flush().loadedTiles(loadedTiles);
-            context.history().reset().merge(d3.values(baseEntities));
-            context.background().baseLayerSource(background);
-            if (history) context.history().fromJSON(history, false);
-            context.map().centerZoom(center, zoom);
-            window.location.replace(hash);
-            context.inIntro(false);
-        });
+            items.selectAll('.entity-type')
+                .text(function(entity) { return context.presets().match(entity, context.graph()).name(); });
 
-        var navwrap = selection.append('div').attr('class', 'intro-nav-wrap fillD');
+            items.selectAll('.entity-name')
+                .text(function(entity) { return iD.util.displayName(entity); });
 
-        var buttonwrap = navwrap.append('div')
-            .attr('class', 'joined')
-            .selectAll('button.step');
+            // Exit
+            items.exit()
+                .remove();
+        }
+    }
 
-        var entered = buttonwrap
-            .data(steps)
-            .enter()
-            .append('button')
-            .attr('class', 'step')
-            .on('click', enter);
+    return selectionList;
 
-        entered
-            .call(iD.svg.Icon('#icon-apply', 'pre-text'));
+};
+iD.ui.FeatureInfo = function(context) {
+    function update(selection) {
+        var features = context.features(),
+            stats = features.stats(),
+            count = 0,
+            hiddenList = _.compact(_.map(features.hidden(), function(k) {
+                if (stats[k]) {
+                    count += stats[k];
+                    return String(stats[k]) + ' ' + t('feature.' + k + '.description');
+                }
+            }));
 
-        entered
-            .append('label')
-            .text(function(d) { return t(d.title); });
+        selection.html('');
 
-        enter(steps[0]);
+        if (hiddenList.length) {
+            var tooltip = bootstrap.tooltip()
+                    .placement('top')
+                    .html(true)
+                    .title(function() {
+                        return iD.ui.tooltipHtml(hiddenList.join('<br/>'));
+                    });
 
-        function enter (newStep) {
-            if (step) { step.exit(); }
-
-            context.enter(iD.modes.Browse(context));
-
-            step = newStep;
-            step.enter();
-
-            entered.classed('active', function(d) {
-                return d.title === step.title;
-            });
+            var warning = selection.append('a')
+                .attr('href', '#')
+                .attr('tabindex', -1)
+                .html(t('feature_info.hidden_warning', { count: count }))
+                .call(tooltip)
+                .on('click', function() {
+                    tooltip.hide(warning);
+                    // open map data panel?
+                    d3.event.preventDefault();
+                });
         }
 
+        selection
+            .classed('hide', !hiddenList.length);
     }
-    return intro;
-};
-
-iD.ui.intro.pointBox = function(point, context) {
-    var rect = context.surfaceRect();
-    point = context.projection(point);
-    return {
-        left: point[0] + rect.left - 30,
-        top: point[1] + rect.top - 50,
-        width: 60,
-        height: 70
-    };
-};
-
-iD.ui.intro.pad = function(box, padding, context) {
-    if (box instanceof Array) {
-        var rect = context.surfaceRect();
-        box = context.projection(box);
-        box = {
-            left: box[0] + rect.left,
-            top: box[1] + rect.top
-        };
-    }
-    return {
-        left: box.left - padding,
-        top: box.top - padding,
-        width: (box.width || 0) + 2 * padding,
-        height: (box.width || 0) + 2 * padding
-    };
-};
-
-iD.ui.intro.icon = function(name, svgklass) {
-    return '<svg class="icon ' + (svgklass || '') + '">' +
-        '<use xlink:href="' + name + '"></use></svg>';
-};
-iD.ui.Geolocate = function(map) {
-    function click() {
-        navigator.geolocation.getCurrentPosition(
-            success, error);
-    }
-
-    function success(position) {
-        var extent = iD.geo.Extent([position.coords.longitude, position.coords.latitude])
-            .padByMeters(position.coords.accuracy);
-
-        map.centerZoom(extent.center(), Math.min(20, map.extentZoom(extent)));
-    }
-
-    function error() { }
 
     return function(selection) {
-        if (!navigator.geolocation) return;
+        update(selection);
 
-        selection.append('button')
-            .attr('tabindex', -1)
-            .attr('title', t('geolocate.title'))
-            .on('click', click)
-            .call(iD.svg.Icon('#icon-geolocate', 'light'))
-            .call(bootstrap.tooltip()
-                .placement('left'));
+        context.features().on('change.feature_info', function() {
+            update(selection);
+        });
     };
 };
 iD.ui.EntityEditor = function(context) {
@@ -32664,6 +32647,102 @@ iD.ui.EntityEditor = function(context) {
     };
 
     return d3.rebind(entityEditor, dispatch, 'on');
+};
+iD.ui.Inspector = function(context) {
+    var presetList = iD.ui.PresetList(context),
+        entityEditor = iD.ui.EntityEditor(context),
+        state = 'select',
+        entityID,
+        newFeature = false;
+
+    function inspector(selection) {
+        presetList
+            .entityID(entityID)
+            .autofocus(newFeature)
+            .on('choose', setPreset);
+
+        entityEditor
+            .state(state)
+            .entityID(entityID)
+            .on('choose', showList);
+
+        var $wrap = selection.selectAll('.panewrap')
+            .data([0]);
+
+        var $enter = $wrap.enter().append('div')
+            .attr('class', 'panewrap');
+
+        $enter.append('div')
+            .attr('class', 'preset-list-pane pane');
+
+        $enter.append('div')
+            .attr('class', 'entity-editor-pane pane');
+
+        var $presetPane = $wrap.select('.preset-list-pane');
+        var $editorPane = $wrap.select('.entity-editor-pane');
+
+        var graph = context.graph(),
+            entity = context.entity(entityID),
+            showEditor = state === 'hover' ||
+                entity.isUsed(graph) ||
+                entity.isHighwayIntersection(graph);
+
+        if (showEditor) {
+            $wrap.style('right', '0%');
+            $editorPane.call(entityEditor);
+        } else {
+            $wrap.style('right', '-100%');
+            $presetPane.call(presetList);
+        }
+
+        var $footer = selection.selectAll('.footer')
+            .data([0]);
+
+        $footer.enter().append('div')
+            .attr('class', 'footer');
+
+        selection.select('.footer')
+            .call(iD.ui.ViewOnOSM(context)
+                .entityID(entityID));
+
+        function showList(preset) {
+            $wrap.transition()
+                .styleTween('right', function() { return d3.interpolate('0%', '-100%'); });
+
+            $presetPane.call(presetList
+                .preset(preset)
+                .autofocus(true));
+        }
+
+        function setPreset(preset) {
+            $wrap.transition()
+                .styleTween('right', function() { return d3.interpolate('-100%', '0%'); });
+
+            $editorPane.call(entityEditor
+                .preset(preset));
+        }
+    }
+
+    inspector.state = function(_) {
+        if (!arguments.length) return state;
+        state = _;
+        entityEditor.state(state);
+        return inspector;
+    };
+
+    inspector.entityID = function(_) {
+        if (!arguments.length) return entityID;
+        entityID = _;
+        return inspector;
+    };
+
+    inspector.newFeature = function(_) {
+        if (!arguments.length) return newFeature;
+        newFeature = _;
+        return inspector;
+    };
+
+    return inspector;
 };
 iD.ui.Background = function(context) {
     var key = 'B',
@@ -33022,261 +33101,138 @@ iD.ui.Background = function(context) {
 
     return background;
 };
-iD.ui.FeatureList = function(context) {
-    var geocodeResults;
+iD.ui.RadialMenu = function(context, operations) {
+    var menu,
+        center = [0, 0],
+        tooltip;
 
-    function featureList(selection) {
-        var header = selection.append('div')
-            .attr('class', 'header fillL cf');
+    var radialMenu = function(selection) {
+        if (!operations.length)
+            return;
 
-        header.append('h3')
-            .text(t('inspector.feature_list'));
+        selection.node().parentNode.focus();
 
-        function keypress() {
-            var q = search.property('value'),
-                items = list.selectAll('.feature-list-item');
-            if (d3.event.keyCode === 13 && q.length && items.size()) {
-                click(items.datum());
-            }
+        function click(operation) {
+            d3.event.stopPropagation();
+            if (operation.disabled())
+                return;
+            operation();
+            radialMenu.close();
         }
 
-        function inputevent() {
-            geocodeResults = undefined;
-            drawList();
-        }
+        menu = selection.append('g')
+            .attr('class', 'radial-menu')
+            .attr('transform', 'translate(' + center + ')')
+            .attr('opacity', 0);
 
-        var searchWrap = selection.append('div')
-            .attr('class', 'search-header');
+        menu.transition()
+            .attr('opacity', 1);
 
-        var search = searchWrap.append('input')
-            .attr('placeholder', t('inspector.search'))
-            .attr('type', 'search')
-            .on('keypress', keypress)
-            .on('input', inputevent);
+        var r = 50,
+            a = Math.PI / 4,
+            a0 = -Math.PI / 4,
+            a1 = a0 + (operations.length - 1) * a;
 
-        searchWrap
-            .call(iD.svg.Icon('#icon-search', 'pre-text'));
+        menu.append('path')
+            .attr('class', 'radial-menu-background')
+            .attr('d', 'M' + r * Math.sin(a0) + ',' +
+                             r * Math.cos(a0) +
+                      ' A' + r + ',' + r + ' 0 ' + (operations.length > 5 ? '1' : '0') + ',0 ' +
+                             (r * Math.sin(a1) + 1e-3) + ',' +
+                             (r * Math.cos(a1) + 1e-3)) // Force positive-length path (#1305)
+            .attr('stroke-width', 50)
+            .attr('stroke-linecap', 'round');
 
-        var listWrap = selection.append('div')
-            .attr('class', 'inspector-body');
-
-        var list = listWrap.append('div')
-            .attr('class', 'feature-list cf');
-
-        context
-            .on('exit.feature-list', clearSearch);
-        context.map()
-            .on('drawn.feature-list', mapDrawn);
-
-        function clearSearch() {
-            search.property('value', '');
-            drawList();
-        }
-
-        function mapDrawn(e) {
-            if (e.full) {
-                drawList();
-            }
-        }
-
-        function features() {
-            var entities = {},
-                result = [],
-                graph = context.graph(),
-                q = search.property('value').toLowerCase();
-
-            if (!q) return result;
-
-            var idMatch = q.match(/^([nwr])([0-9]+)$/);
-
-            if (idMatch) {
-                result.push({
-                    id: idMatch[0],
-                    geometry: idMatch[1] === 'n' ? 'point' : idMatch[1] === 'w' ? 'line' : 'relation',
-                    type: idMatch[1] === 'n' ? t('inspector.node') : idMatch[1] === 'w' ? t('inspector.way') : t('inspector.relation'),
-                    name: idMatch[2]
-                });
-            }
-
-            var locationMatch = sexagesimal.pair(q.toUpperCase()) || q.match(/^(-?\d+\.?\d*)\s+(-?\d+\.?\d*)$/);
-
-            if (locationMatch) {
-                var loc = [parseFloat(locationMatch[0]), parseFloat(locationMatch[1])];
-                result.push({
-                    id: -1,
-                    geometry: 'point',
-                    type: t('inspector.location'),
-                    name: loc[0].toFixed(6) + ', ' + loc[1].toFixed(6),
-                    location: loc
-                });
-            }
-
-            function addEntity(entity) {
-                if (entity.id in entities || result.length > 200)
-                    return;
-
-                entities[entity.id] = true;
-
-                var name = iD.util.displayName(entity) || '';
-                if (name.toLowerCase().indexOf(q) >= 0) {
-                    result.push({
-                        id: entity.id,
-                        entity: entity,
-                        geometry: context.geometry(entity.id),
-                        type: context.presets().match(entity, graph).name(),
-                        name: name
-                    });
-                }
-
-                graph.parentRelations(entity).forEach(function(parent) {
-                    addEntity(parent);
-                });
-            }
-
-            var visible = context.surface().selectAll('.point, .line, .area')[0];
-            for (var i = 0; i < visible.length && result.length <= 200; i++) {
-                addEntity(visible[i].__data__);
-            }
-
-            (geocodeResults || []).forEach(function(d) {
-                // https://github.com/openstreetmap/iD/issues/1890
-                if (d.osm_type && d.osm_id) {
-                    result.push({
-                        id: iD.Entity.id.fromOSM(d.osm_type, d.osm_id),
-                        geometry: d.osm_type === 'relation' ? 'relation' : d.osm_type === 'way' ? 'line' : 'point',
-                        type: d.type !== 'yes' ? (d.type.charAt(0).toUpperCase() + d.type.slice(1)).replace('_', ' ')
-                                               : (d.class.charAt(0).toUpperCase() + d.class.slice(1)).replace('_', ' '),
-                        name: d.display_name,
-                        extent: new iD.geo.Extent(
-                            [parseFloat(d.boundingbox[3]), parseFloat(d.boundingbox[0])],
-                            [parseFloat(d.boundingbox[2]), parseFloat(d.boundingbox[1])])
-                    });
-                }
+        var button = menu.selectAll()
+            .data(operations)
+            .enter()
+            .append('g')
+            .attr('class', function(d) { return 'radial-menu-item radial-menu-item-' + d.id; })
+            .classed('disabled', function(d) { return d.disabled(); })
+            .attr('transform', function(d, i) {
+                return 'translate(' + iD.geo.roundCoords([
+                        r * Math.sin(a0 + i * a),
+                        r * Math.cos(a0 + i * a)]).join(',') + ')';
             });
 
-            return result;
+        button.append('circle')
+            .attr('r', 15)
+            .on('click', click)
+            .on('mousedown', mousedown)
+            .on('mouseover', mouseover)
+            .on('mouseout', mouseout);
+
+        button.append('use')
+            .attr('transform', 'translate(-10,-10)')
+            .attr('width', '20')
+            .attr('height', '20')
+            .attr('xlink:href', function(d) { return '#operation-' + d.id; });
+
+        tooltip = d3.select(document.body)
+            .append('div')
+            .attr('class', 'tooltip-inner radial-menu-tooltip');
+
+        function mousedown() {
+            d3.event.stopPropagation(); // https://github.com/openstreetmap/iD/issues/1869
         }
 
-        function drawList() {
-            var value = search.property('value'),
-                results = features();
+        function mouseover(d, i) {
+            var rect = context.surfaceRect(),
+                angle = a0 + i * a,
+                top = rect.top + (r + 25) * Math.cos(angle) + center[1] + 'px',
+                left = rect.left + (r + 25) * Math.sin(angle) + center[0] + 'px',
+                bottom = rect.height - (r + 25) * Math.cos(angle) - center[1] + 'px',
+                right = rect.width - (r + 25) * Math.sin(angle) - center[0] + 'px';
 
-            list.classed('filtered', value.length);
+            tooltip
+                .style('top', null)
+                .style('left', null)
+                .style('bottom', null)
+                .style('right', null)
+                .style('display', 'block')
+                .html(iD.ui.tooltipHtml(d.tooltip(), d.keys[0]));
 
-            var noResultsWorldwide = geocodeResults && geocodeResults.length === 0;
-
-            var resultsIndicator = list.selectAll('.no-results-item')
-                .data([0])
-                .enter().append('button')
-                .property('disabled', true)
-                .attr('class', 'no-results-item')
-                .call(iD.svg.Icon('#icon-alert', 'pre-text'));
-
-            resultsIndicator.append('span')
-                .attr('class', 'entity-name');
-
-            list.selectAll('.no-results-item .entity-name')
-                .text(noResultsWorldwide ? t('geocoder.no_results_worldwide') : t('geocoder.no_results_visible'));
-
-            list.selectAll('.geocode-item')
-                .data([0])
-                .enter().append('button')
-                .attr('class', 'geocode-item')
-                .on('click', geocode)
-                .append('div')
-                .attr('class', 'label')
-                .append('span')
-                .attr('class', 'entity-name')
-                .text(t('geocoder.search'));
-
-            list.selectAll('.no-results-item')
-                .style('display', (value.length && !results.length) ? 'block' : 'none');
-
-            list.selectAll('.geocode-item')
-                .style('display', (value && geocodeResults === undefined) ? 'block' : 'none');
-
-            list.selectAll('.feature-list-item')
-                .data([-1])
-                .remove();
-
-            var items = list.selectAll('.feature-list-item')
-                .data(results, function(d) { return d.id; });
-
-            var enter = items.enter()
-                .insert('button', '.geocode-item')
-                .attr('class', 'feature-list-item')
-                .on('mouseover', mouseover)
-                .on('mouseout', mouseout)
-                .on('click', click);
-
-            var label = enter
-                .append('div')
-                .attr('class', 'label');
-
-            label.each(function(d) {
-                d3.select(this)
-                    .call(iD.svg.Icon('#icon-' + d.geometry, 'pre-text'));
-            });
-
-            label.append('span')
-                .attr('class', 'entity-type')
-                .text(function(d) { return d.type; });
-
-            label.append('span')
-                .attr('class', 'entity-name')
-                .text(function(d) { return d.name; });
-
-            enter.style('opacity', 0)
-                .transition()
-                .style('opacity', 1);
-
-            items.order();
-
-            items.exit()
-                .remove();
-        }
-
-        function mouseover(d) {
-            if (d.id === -1) return;
-
-            context.surface().selectAll(iD.util.entityOrMemberSelector([d.id], context.graph()))
-                .classed('hover', true);
+            if (i === 0) {
+                tooltip
+                    .style('right', right)
+                    .style('top', top);
+            } else if (i >= 4) {
+                tooltip
+                    .style('left', left)
+                    .style('bottom', bottom);
+            } else {
+                tooltip
+                    .style('left', left)
+                    .style('top', top);
+            }
         }
 
         function mouseout() {
-            context.surface().selectAll('.hover')
-                .classed('hover', false);
+            tooltip.style('display', 'none');
+        }
+    };
+
+    radialMenu.close = function() {
+        if (menu) {
+            menu
+                .style('pointer-events', 'none')
+                .transition()
+                .attr('opacity', 0)
+                .remove();
         }
 
-        function click(d) {
-            d3.event.preventDefault();
-            if (d.location) {
-                context.map().centerZoom([d.location[1], d.location[0]], 20);
-            }
-            else if (d.entity) {
-                if (d.entity.type === 'node') {
-                    context.map().center(d.entity.loc);
-                } else if (d.entity.type === 'way') {
-                    var center = context.projection(context.map().center()),
-                        edge = iD.geo.chooseEdge(context.childNodes(d.entity), center, context.projection);
-                    context.map().center(edge.loc);
-                }
-                context.enter(iD.modes.Select(context, [d.entity.id]).suppressMenu(true));
-            } else {
-                context.zoomToEntity(d.id);
-            }
+        if (tooltip) {
+            tooltip.remove();
         }
+    };
 
-        function geocode() {
-            var searchVal = encodeURIComponent(search.property('value'));
-            d3.json('https://nominatim.openstreetmap.org/search/' + searchVal + '?limit=10&format=json', function(err, resp) {
-                geocodeResults = resp || [];
-                drawList();
-            });
-        }
-    }
+    radialMenu.center = function(_) {
+        if (!arguments.length) return center;
+        center = _;
+        return radialMenu;
+    };
 
-    return featureList;
+    return radialMenu;
 };
 iD.ui.confirm = function(selection) {
     var modal = iD.ui.modal(selection);
@@ -33308,162 +33264,6 @@ iD.ui.confirm = function(selection) {
     };
 
     return modal;
-};
-iD.ui.Help = function(context) {
-    var key = 'H';
-
-    var docKeys = [
-        'help.help',
-        'help.editing_saving',
-        'help.roads',
-        'help.gps',
-        'help.imagery',
-        'help.addresses',
-        'help.inspector',
-        'help.buildings',
-        'help.relations'];
-
-    var docs = docKeys.map(function(key) {
-        var text = t(key);
-        return {
-            title: text.split('\n')[0].replace('#', '').trim(),
-            html: marked(text.split('\n').slice(1).join('\n'))
-        };
-    });
-
-    function help(selection) {
-
-        function hide() {
-            setVisible(false);
-        }
-
-        function toggle() {
-            if (d3.event) d3.event.preventDefault();
-            tooltip.hide(button);
-            setVisible(!button.classed('active'));
-        }
-
-        function setVisible(show) {
-            if (show !== shown) {
-                button.classed('active', show);
-                shown = show;
-
-                if (show) {
-                    selection.on('mousedown.help-inside', function() {
-                        return d3.event.stopPropagation();
-                    });
-                    pane.style('display', 'block')
-                        .style('right', '-500px')
-                        .transition()
-                        .duration(200)
-                        .style('right', '0px');
-                } else {
-                    pane.style('right', '0px')
-                        .transition()
-                        .duration(200)
-                        .style('right', '-500px')
-                        .each('end', function() {
-                            d3.select(this).style('display', 'none');
-                        });
-                    selection.on('mousedown.help-inside', null);
-                }
-            }
-        }
-
-        function clickHelp(d, i) {
-            pane.property('scrollTop', 0);
-            doctitle.html(d.title);
-            body.html(d.html);
-            body.selectAll('a')
-                .attr('target', '_blank');
-            menuItems.classed('selected', function(m) {
-                return m.title === d.title;
-            });
-
-            nav.html('');
-
-            if (i > 0) {
-                var prevLink = nav.append('a')
-                    .attr('class', 'previous')
-                    .on('click', function() {
-                        clickHelp(docs[i - 1], i - 1);
-                    });
-                prevLink.append('span').html('&#9668; ' + docs[i - 1].title);
-            }
-            if (i < docs.length - 1) {
-                var nextLink = nav.append('a')
-                    .attr('class', 'next')
-                    .on('click', function() {
-                        clickHelp(docs[i + 1], i + 1);
-                    });
-                nextLink.append('span').html(docs[i + 1].title + ' &#9658;');
-            }
-        }
-
-        function clickWalkthrough() {
-            d3.select(document.body).call(iD.ui.intro(context));
-            setVisible(false);
-        }
-
-
-        var pane = selection.append('div')
-                .attr('class', 'help-wrap map-overlay fillL col5 content hide'),
-            tooltip = bootstrap.tooltip()
-                .placement('left')
-                .html(true)
-                .title(iD.ui.tooltipHtml(t('help.title'), key)),
-            button = selection.append('button')
-                .attr('tabindex', -1)
-                .on('click', toggle)
-                .call(iD.svg.Icon('#icon-help', 'light'))
-                .call(tooltip),
-            shown = false;
-
-
-        var toc = pane.append('ul')
-            .attr('class', 'toc');
-
-        var menuItems = toc.selectAll('li')
-            .data(docs)
-            .enter()
-            .append('li')
-            .append('a')
-            .html(function(d) { return d.title; })
-            .on('click', clickHelp);
-
-        toc.append('li')
-            .attr('class','walkthrough')
-            .append('a')
-            .text(t('splash.walkthrough'))
-            .on('click', clickWalkthrough);
-
-        var content = pane.append('div')
-            .attr('class', 'left-content');
-
-        var doctitle = content.append('h2')
-            .text(t('help.title'));
-
-        var body = content.append('div')
-            .attr('class', 'body');
-
-        var nav = content.append('div')
-            .attr('class', 'nav');
-
-        clickHelp(docs[0], 0);
-
-        var keybinding = d3.keybinding('help')
-            .on(key, toggle)
-            .on('B', hide)
-            .on('F', hide);
-
-        d3.select(document)
-            .call(keybinding);
-
-        context.surface().on('mousedown.help-outside', hide);
-        context.container().on('mousedown.help-outside', hide);
-    }
-
-    return help;
 };
 iD.ui.PresetIcon = function() {
     var preset, geometry;
@@ -33621,127 +33421,297 @@ iD.ui.Zoom = function(context) {
             .call(keybinding);
     };
 };
-iD.ui.ViewOnOSM = function(context) {
-    var id;
+iD.ui.Conflicts = function(context) {
+    var dispatch = d3.dispatch('download', 'cancel', 'save'),
+        list;
 
-    function viewOnOSM(selection) {
-        var entity = context.entity(id);
+    function conflicts(selection) {
+        var header = selection
+            .append('div')
+            .attr('class', 'header fillL');
 
-        selection.style('display', entity.isNew() ? 'none' : null);
+        header
+            .append('button')
+            .attr('class', 'fr')
+            .on('click', function() { dispatch.cancel(); })
+            .call(iD.svg.Icon('#icon-close'));
 
-        var $link = selection.selectAll('.view-on-osm')
-            .data([0]);
+        header
+            .append('h3')
+            .text(t('save.conflict.header'));
 
-        $link.enter()
+        var body = selection
+            .append('div')
+            .attr('class', 'body fillL');
+
+        body
+            .append('div')
+            .attr('class', 'conflicts-help')
+            .text(t('save.conflict.help'))
             .append('a')
-            .attr('class', 'view-on-osm')
-            .attr('target', '_blank')
-            .call(iD.svg.Icon('#icon-out-link', 'inline'))
-            .append('span')
-            .text(t('inspector.view_on_osm'));
+            .attr('class', 'conflicts-download')
+            .text(t('save.conflict.download_changes'))
+            .on('click.download', function() { dispatch.download(); });
 
-        $link
-            .attr('href', context.connection().entityURL(entity));
+        body
+            .append('div')
+            .attr('class', 'conflict-container fillL3')
+            .call(showConflict, 0);
+
+        body
+            .append('div')
+            .attr('class', 'conflicts-done')
+            .attr('opacity', 0)
+            .style('display', 'none')
+            .text(t('save.conflict.done'));
+
+        var buttons = body
+            .append('div')
+            .attr('class','buttons col12 joined conflicts-buttons');
+
+        buttons
+            .append('button')
+            .attr('disabled', list.length > 1)
+            .attr('class', 'action conflicts-button col6')
+            .text(t('save.title'))
+            .on('click.try_again', function() { dispatch.save(); });
+
+        buttons
+            .append('button')
+            .attr('class', 'secondary-action conflicts-button col6')
+            .text(t('confirm.cancel'))
+            .on('click.cancel', function() { dispatch.cancel(); });
     }
 
-    viewOnOSM.entityID = function(_) {
-        if (!arguments.length) return id;
-        id = _;
-        return viewOnOSM;
-    };
 
-    return viewOnOSM;
-};
-iD.ui.FeatureInfo = function(context) {
-    function update(selection) {
-        var features = context.features(),
-            stats = features.stats(),
-            count = 0,
-            hiddenList = _.compact(_.map(features.hidden(), function(k) {
-                if (stats[k]) {
-                    count += stats[k];
-                    return String(stats[k]) + ' ' + t('feature.' + k + '.description');
-                }
-            }));
+    function showConflict(selection, index) {
+        if (index < 0 || index >= list.length) return;
 
-        selection.html('');
+        var parent = d3.select(selection.node().parentNode);
 
-        if (hiddenList.length) {
-            var tooltip = bootstrap.tooltip()
-                    .placement('top')
-                    .html(true)
-                    .title(function() {
-                        return iD.ui.tooltipHtml(hiddenList.join('<br/>'));
-                    });
+        // enable save button if this is the last conflict being reviewed..
+        if (index === list.length - 1) {
+            window.setTimeout(function() {
+                parent.select('.conflicts-button')
+                    .attr('disabled', null);
 
-            var warning = selection.append('a')
-                .attr('href', '#')
-                .attr('tabindex', -1)
-                .html(t('feature_info.hidden_warning', { count: count }))
-                .call(tooltip)
-                .on('click', function() {
-                    tooltip.hide(warning);
-                    // open map data panel?
-                    d3.event.preventDefault();
-                });
+                parent.select('.conflicts-done')
+                    .transition()
+                    .attr('opacity', 1)
+                    .style('display', 'block');
+            }, 250);
         }
 
-        selection
-            .classed('hide', !hiddenList.length);
+        var item = selection
+            .selectAll('.conflict')
+            .data([list[index]]);
+
+        var enter = item.enter()
+            .append('div')
+            .attr('class', 'conflict');
+
+        enter
+            .append('h4')
+            .attr('class', 'conflict-count')
+            .text(t('save.conflict.count', { num: index + 1, total: list.length }));
+
+        enter
+            .append('a')
+            .attr('class', 'conflict-description')
+            .attr('href', '#')
+            .text(function(d) { return d.name; })
+            .on('click', function(d) {
+                zoomToEntity(d.id);
+                d3.event.preventDefault();
+            });
+
+        var details = enter
+            .append('div')
+            .attr('class', 'conflict-detail-container');
+
+        details
+            .append('ul')
+            .attr('class', 'conflict-detail-list')
+            .selectAll('li')
+            .data(function(d) { return d.details || []; })
+            .enter()
+            .append('li')
+            .attr('class', 'conflict-detail-item')
+            .html(function(d) { return d; });
+
+        details
+            .append('div')
+            .attr('class', 'conflict-choices')
+            .call(addChoices);
+
+        details
+            .append('div')
+            .attr('class', 'conflict-nav-buttons joined cf')
+            .selectAll('button')
+            .data(['previous', 'next'])
+            .enter()
+            .append('button')
+            .text(function(d) { return t('save.conflict.' + d); })
+            .attr('class', 'conflict-nav-button action col6')
+            .attr('disabled', function(d, i) {
+                return (i === 0 && index === 0) ||
+                    (i === 1 && index === list.length - 1) || null;
+            })
+            .on('click', function(d, i) {
+                var container = parent.select('.conflict-container'),
+                sign = (i === 0 ? -1 : 1);
+
+                container
+                    .selectAll('.conflict')
+                    .remove();
+
+                container
+                    .call(showConflict, index + sign);
+
+                d3.event.preventDefault();
+            });
+
+        item.exit()
+            .remove();
+
     }
 
-    return function(selection) {
-        update(selection);
+    function addChoices(selection) {
+        var choices = selection
+            .append('ul')
+            .attr('class', 'layer-list')
+            .selectAll('li')
+            .data(function(d) { return d.choices || []; });
 
-        context.features().on('change.feature_info', function() {
-            update(selection);
-        });
+        var enter = choices.enter()
+            .append('li')
+            .attr('class', 'layer');
+
+        var label = enter
+            .append('label');
+
+        label
+            .append('input')
+            .attr('type', 'radio')
+            .attr('name', function(d) { return d.id; })
+            .on('change', function(d, i) {
+                var ul = this.parentNode.parentNode.parentNode;
+                ul.__data__.chosen = i;
+                choose(ul, d);
+            });
+
+        label
+            .append('span')
+            .text(function(d) { return d.text; });
+
+        choices
+            .each(function(d, i) {
+                var ul = this.parentNode;
+                if (ul.__data__.chosen === i) choose(ul, d);
+            });
+    }
+
+    function choose(ul, datum) {
+        if (d3.event) d3.event.preventDefault();
+
+        d3.select(ul)
+            .selectAll('li')
+            .classed('active', function(d) { return d === datum; })
+            .selectAll('input')
+            .property('checked', function(d) { return d === datum; });
+
+        var extent = iD.geo.Extent(),
+            entity;
+
+        entity = context.graph().hasEntity(datum.id);
+        if (entity) extent._extend(entity.extent(context.graph()));
+
+        datum.action();
+
+        entity = context.graph().hasEntity(datum.id);
+        if (entity) extent._extend(entity.extent(context.graph()));
+
+        zoomToEntity(datum.id, extent);
+    }
+
+    function zoomToEntity(id, extent) {
+        context.surface().selectAll('.hover')
+            .classed('hover', false);
+
+        var entity = context.graph().hasEntity(id);
+        if (entity) {
+            if (extent) {
+                context.map().trimmedExtent(extent);
+            } else {
+                context.map().zoomTo(entity);
+            }
+            context.surface().selectAll(
+                iD.util.entityOrMemberSelector([entity.id], context.graph()))
+                .classed('hover', true);
+        }
+    }
+
+
+    // The conflict list should be an array of objects like:
+    // {
+    //     id: id,
+    //     name: entityName(local),
+    //     details: merge.conflicts(),
+    //     chosen: 1,
+    //     choices: [
+    //         choice(id, keepMine, forceLocal),
+    //         choice(id, keepTheirs, forceRemote)
+    //     ]
+    // }
+    conflicts.list = function(_) {
+        if (!arguments.length) return list;
+        list = _;
+        return conflicts;
     };
+
+    return d3.rebind(conflicts, dispatch, 'on');
 };
-iD.ui.Restore = function(context) {
+iD.ui.Splash = function(context) {
     return function(selection) {
-        if (!context.history().lock() || !context.history().restorableChanges())
-            return;
+        if (context.storage('sawSplash'))
+             return;
+
+        context.storage('sawSplash', true);
 
         var modal = iD.ui.modal(selection);
 
         modal.select('.modal')
-            .attr('class', 'modal fillL col6');
+            .attr('class', 'modal-splash modal col6');
 
-        var introModal = modal.select('.content');
-
-        introModal.attr('class','cf');
+        var introModal = modal.select('.content')
+            .append('div')
+            .attr('class', 'fillL');
 
         introModal.append('div')
-            .attr('class', 'modal-section')
-            .append('h3')
-            .text(t('restore.heading'));
+            .attr('class','modal-section cf')
+            .append('h3').text(t('splash.welcome'));
 
         introModal.append('div')
             .attr('class','modal-section')
             .append('p')
-            .text(t('restore.description'));
+            .html(t('splash.text'));
 
-        var buttonWrap = introModal.append('div')
-            .attr('class', 'modal-actions cf');
+        var buttons = introModal.append('div').attr('class', 'modal-actions cf');
 
-        var restore = buttonWrap.append('button')
-            .attr('class', 'restore col6')
-            .text(t('restore.restore'))
+        buttons.append('button')
+            .attr('class', 'col6')
+            .text(t('splash.walkthrough'))
             .on('click', function() {
-                context.history().restore();
-                modal.remove();
+                window.location = 'http://labs.strava.com/slide';
             });
 
-        buttonWrap.append('button')
-            .attr('class', 'reset col6')
-            .text(t('restore.reset'))
-            .on('click', function() {
-                context.history().clearSaved();
-                modal.remove();
-            });
+        buttons.append('button')
+            .attr('class', 'col6 start')
+            .text(t('splash.start'))
+            .on('click', modal.close);
 
-        restore.node().focus();
+        modal.select('button.close').attr('class','hide');
+
     };
 };
 iD.ui.MapData = function(context) {
@@ -34342,6 +34312,31 @@ iD.ui.flash = function(selection) {
 
     return modal;
 };
+iD.ui.Notice = function(context) {
+    return function(selection) {
+        var div = selection.append('div')
+            .attr('class', 'notice');
+
+        var button = div.append('button')
+            .attr('class', 'zoom-to notice')
+            .on('click', function() { context.map().zoom(context.minEditableZoom()); });
+
+        button
+            .call(iD.svg.Icon('#icon-plus', 'pre-text'))
+            .append('span')
+            .attr('class', 'label')
+            .text(t('zoom_in_edit'));
+
+        function disableTooHigh() {
+            div.style('display', context.editable() ? 'none' : 'block');
+        }
+
+        context.map()
+            .on('move.notice', _.debounce(disableTooHigh, 500));
+
+        disableTooHigh();
+    };
+};
 iD.ui.RawMemberEditor = function(context) {
     var id;
 
@@ -34460,75 +34455,221 @@ iD.ui.RawMemberEditor = function(context) {
 
     return rawMemberEditor;
 };
-iD.ui.SelectionList = function(context, selectedIDs) {
-
-    function selectEntity(entity) {
-        context.enter(iD.modes.Select(context, [entity.id]).suppressMenu(true));
+iD.ui.Geolocate = function(map) {
+    function click() {
+        navigator.geolocation.getCurrentPosition(
+            success, error);
     }
 
+    function success(position) {
+        var extent = iD.geo.Extent([position.coords.longitude, position.coords.latitude])
+            .padByMeters(position.coords.accuracy);
 
-    function selectionList(selection) {
-        selection.classed('selection-list-pane', true);
+        map.centerZoom(extent.center(), Math.min(20, map.extentZoom(extent)));
+    }
 
-        var header = selection.append('div')
-            .attr('class', 'header fillL cf');
+    function error() { }
 
-        header.append('h3')
-            .text(t('inspector.multiselect'));
+    return function(selection) {
+        if (!navigator.geolocation) return;
 
-        var listWrap = selection.append('div')
-            .attr('class', 'inspector-body');
+        selection.append('button')
+            .attr('tabindex', -1)
+            .attr('title', t('geolocate.title'))
+            .on('click', click)
+            .call(iD.svg.Icon('#icon-geolocate', 'light'))
+            .call(bootstrap.tooltip()
+                .placement('left'));
+    };
+};
+iD.ui.intro = function(context) {
+    var step;
 
-        var list = listWrap.append('div')
-            .attr('class', 'feature-list cf');
+    function intro(selection) {
 
-        context.history().on('change.selection-list', drawList);
-        drawList();
-
-        function drawList() {
-            var entities = selectedIDs
-                .map(function(id) { return context.hasEntity(id); })
-                .filter(function(entity) { return entity; });
-
-            var items = list.selectAll('.feature-list-item')
-                .data(entities, iD.Entity.key);
-
-            var enter = items.enter().append('button')
-                .attr('class', 'feature-list-item')
-                .on('click', selectEntity);
-
-            // Enter
-            var label = enter.append('div')
-                .attr('class', 'label')
-                .call(iD.svg.Icon('', 'pre-text'));
-
-            label.append('span')
-                .attr('class', 'entity-type');
-
-            label.append('span')
-                .attr('class', 'entity-name');
-
-            // Update
-            items.selectAll('use')
-                .attr('href', function() {
-                    var entity = this.parentNode.parentNode.__data__;
-                    return '#icon-' + context.geometry(entity.id);
-                });
-
-            items.selectAll('.entity-type')
-                .text(function(entity) { return context.presets().match(entity, context.graph()).name(); });
-
-            items.selectAll('.entity-name')
-                .text(function(entity) { return iD.util.displayName(entity); });
-
-            // Exit
-            items.exit()
-                .remove();
+        function localizedName(id) {
+            var features = {
+                n2140018997: 'city_hall',
+                n367813436: 'fire_department',
+                w203988286: 'memory_isle_park',
+                w203972937: 'riverwalk_trail',
+                w203972938: 'riverwalk_trail',
+                w203972940: 'riverwalk_trail',
+                w41785752: 'w_michigan_ave',
+                w134150789: 'w_michigan_ave',
+                w134150795: 'w_michigan_ave',
+                w134150800: 'w_michigan_ave',
+                w134150811: 'w_michigan_ave',
+                w134150802: 'e_michigan_ave',
+                w134150836: 'e_michigan_ave',
+                w41074896: 'e_michigan_ave',
+                w17965834: 'spring_st',
+                w203986457: 'scidmore_park',
+                w203049587: 'petting_zoo',
+                w17967397: 'n_andrews_st',
+                w17967315: 's_andrews_st',
+                w17967326: 'n_constantine_st',
+                w17966400: 's_constantine_st',
+                w170848823: 'rocky_river',
+                w170848824: 'rocky_river',
+                w170848331: 'rocky_river',
+                w17967752: 'railroad_dr',
+                w17965998: 'conrail_rr',
+                w134150845: 'conrail_rr',
+                w170989131: 'st_joseph_river',
+                w143497377: 'n_main_st',
+                w134150801: 's_main_st',
+                w134150830: 's_main_st',
+                w17966462: 's_main_st',
+                w17967734: 'water_st',
+                w17964996: 'foster_st',
+                w170848330: 'portage_river',
+                w17965351: 'flower_st',
+                w17965502: 'elm_st',
+                w17965402: 'walnut_st',
+                w17964793: 'morris_ave',
+                w17967444: 'east_st',
+                w17966984: 'portage_ave'
+            };
+            return features[id] && t('intro.graph.' + features[id]);
         }
+
+        context.enter(iD.modes.Browse(context));
+
+        // Save current map state
+        var history = context.history().toJSON(),
+            hash = window.location.hash,
+            center = context.map().center(),
+            zoom = context.map().zoom(),
+            background = context.background().baseLayerSource(),
+            opacity = d3.select('.background-layer').style('opacity'),
+            loadedTiles = context.connection().loadedTiles(),
+            baseEntities = context.history().graph().base().entities,
+            introGraph, name;
+
+        // Block saving
+        context.inIntro(true);
+
+        // Load semi-real data used in intro
+        context.connection().toggle(false).flush();
+        context.history().reset();
+
+        introGraph = JSON.parse(iD.introGraph);
+        for (var key in introGraph) {
+            introGraph[key] = iD.Entity(introGraph[key]);
+            name = localizedName(key);
+            if (name) {
+                introGraph[key].tags.name = name;
+            }
+        }
+        context.history().merge(d3.values(iD.Graph().load(introGraph).entities));
+        context.background().bing();
+
+        d3.select('.background-layer').style('opacity', 1);
+
+        var curtain = d3.curtain();
+        selection.call(curtain);
+
+        function reveal(box, text, options) {
+            options = options || {};
+            if (text) curtain.reveal(box, text, options.tooltipClass, options.duration);
+            else curtain.reveal(box, '', '', options.duration);
+        }
+
+        var steps = ['navigation', 'point', 'area', 'line', 'startEditing'].map(function(step, i) {
+            var s = iD.ui.intro[step](context, reveal)
+                .on('done', function() {
+                    entered.filter(function(d) {
+                        return d.title === s.title;
+                    }).classed('finished', true);
+                    enter(steps[i + 1]);
+                });
+            return s;
+        });
+
+        steps[steps.length - 1].on('startEditing', function() {
+            curtain.remove();
+            navwrap.remove();
+            d3.select('.background-layer').style('opacity', opacity);
+            context.connection().toggle(true).flush().loadedTiles(loadedTiles);
+            context.history().reset().merge(d3.values(baseEntities));
+            context.background().baseLayerSource(background);
+            if (history) context.history().fromJSON(history, false);
+            context.map().centerZoom(center, zoom);
+            window.location.replace(hash);
+            context.inIntro(false);
+        });
+
+        var navwrap = selection.append('div').attr('class', 'intro-nav-wrap fillD');
+
+        var buttonwrap = navwrap.append('div')
+            .attr('class', 'joined')
+            .selectAll('button.step');
+
+        var entered = buttonwrap
+            .data(steps)
+            .enter()
+            .append('button')
+            .attr('class', 'step')
+            .on('click', enter);
+
+        entered
+            .call(iD.svg.Icon('#icon-apply', 'pre-text'));
+
+        entered
+            .append('label')
+            .text(function(d) { return t(d.title); });
+
+        enter(steps[0]);
+
+        function enter (newStep) {
+            if (step) { step.exit(); }
+
+            context.enter(iD.modes.Browse(context));
+
+            step = newStep;
+            step.enter();
+
+            entered.classed('active', function(d) {
+                return d.title === step.title;
+            });
+        }
+
     }
+    return intro;
+};
 
-    return selectionList;
+iD.ui.intro.pointBox = function(point, context) {
+    var rect = context.surfaceRect();
+    point = context.projection(point);
+    return {
+        left: point[0] + rect.left - 30,
+        top: point[1] + rect.top - 50,
+        width: 60,
+        height: 70
+    };
+};
 
+iD.ui.intro.pad = function(box, padding, context) {
+    if (box instanceof Array) {
+        var rect = context.surfaceRect();
+        box = context.projection(box);
+        box = {
+            left: box[0] + rect.left,
+            top: box[1] + rect.top
+        };
+    }
+    return {
+        left: box.left - padding,
+        top: box.top - padding,
+        width: (box.width || 0) + 2 * padding,
+        height: (box.width || 0) + 2 * padding
+    };
+};
+
+iD.ui.intro.icon = function(name, svgklass) {
+    return '<svg class="icon ' + (svgklass || '') + '">' +
+        '<use xlink:href="' + name + '"></use></svg>';
 };
 iD.ui.RawMembershipEditor = function(context) {
     var id, showBlank;
@@ -34753,448 +34894,230 @@ iD.ui.Toggle = function(show, callback) {
             });
     };
 };
-iD.ui.RadialMenu = function(context, operations) {
-    var menu,
-        center = [0, 0],
-        tooltip;
+iD.ui.Info = function(context) {
+    var key = iD.ui.cmd('⌘I'),
+        imperial = (iD.detect().locale.toLowerCase() === 'en-us');
 
-    var radialMenu = function(selection) {
-        if (!operations.length)
-            return;
+    function info(selection) {
+        function radiansToMeters(r) {
+            // using WGS84 authalic radius (6371007.1809 m)
+            return r * 6371007.1809;
+        }
 
-        selection.node().parentNode.focus();
+        function steradiansToSqmeters(r) {
+            // http://gis.stackexchange.com/a/124857/40446
+            return r / 12.56637 * 510065621724000;
+        }
 
-        function click(operation) {
-            d3.event.stopPropagation();
-            if (operation.disabled())
+        function toLineString(feature) {
+            if (feature.type === 'LineString') return feature;
+
+            var result = { type: 'LineString', coordinates: [] };
+            if (feature.type === 'Polygon') {
+                result.coordinates = feature.coordinates[0];
+            } else if (feature.type === 'MultiPolygon') {
+                result.coordinates = feature.coordinates[0][0];
+            }
+
+            return result;
+        }
+
+        function displayLength(m) {
+            var d = m * (imperial ? 3.28084 : 1),
+                p, unit;
+
+            if (imperial) {
+                if (d >= 5280) {
+                    d /= 5280;
+                    unit = 'mi';
+                } else {
+                    unit = 'ft';
+                }
+            } else {
+                if (d >= 1000) {
+                    d /= 1000;
+                    unit = 'km';
+                } else {
+                    unit = 'm';
+                }
+            }
+
+            // drop unnecessary precision
+            p = d > 1000 ? 0 : d > 100 ? 1 : 2;
+
+            return String(d.toFixed(p)) + ' ' + unit;
+        }
+
+        function displayArea(m2) {
+            var d = m2 * (imperial ? 10.7639111056 : 1),
+                d1, d2, p1, p2, unit1, unit2;
+
+            if (imperial) {
+                if (d >= 6969600) {     // > 0.25mi² show mi²
+                    d1 = d / 27878400;
+                    unit1 = 'mi²';
+                } else {
+                    d1 = d;
+                    unit1 = 'ft²';
+                }
+
+                if (d > 4356 && d < 43560000) {   // 0.1 - 1000 acres
+                    d2 = d / 43560;
+                    unit2 = 'ac';
+                }
+
+            } else {
+                if (d >= 250000) {    // > 0.25km² show km²
+                    d1 = d / 1000000;
+                    unit1 = 'km²';
+                } else {
+                    d1 = d;
+                    unit1 = 'm²';
+                }
+
+                if (d > 1000 && d < 10000000) {   // 0.1 - 1000 hectares
+                    d2 = d / 10000;
+                    unit2 = 'ha';
+                }
+            }
+
+            // drop unnecessary precision
+            p1 = d1 > 1000 ? 0 : d1 > 100 ? 1 : 2;
+            p2 = d2 > 1000 ? 0 : d2 > 100 ? 1 : 2;
+
+            return String(d1.toFixed(p1)) + ' ' + unit1 +
+                (d2 ? ' (' + String(d2.toFixed(p2)) + ' ' + unit2 + ')' : '');
+        }
+
+
+        function redraw() {
+            if (hidden()) return;
+
+            var resolver = context.graph(),
+                selected = _.filter(context.selectedIDs(), function(e) { return context.hasEntity(e); }),
+                singular = selected.length === 1 ? selected[0] : null,
+                extent = iD.geo.Extent(),
+                entity;
+
+            selection.html('');
+            selection.append('h4')
+                .attr('class', 'selection-heading fillD')
+                .text(singular || t('infobox.selected', { n: selected.length }));
+
+            if (!selected.length) return;
+
+            var center;
+            for (var i = 0; i < selected.length; i++) {
+                entity = context.entity(selected[i]);
+                extent._extend(entity.extent(resolver));
+            }
+            center = extent.center();
+
+
+            var list = selection.append('ul');
+
+            // multiple selection, just display extent center..
+            if (!singular) {
+                list.append('li')
+                    .text(t('infobox.center') + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
                 return;
-            operation();
-            radialMenu.close();
-        }
+            }
 
-        menu = selection.append('g')
-            .attr('class', 'radial-menu')
-            .attr('transform', 'translate(' + center + ')')
-            .attr('opacity', 0);
+            // single selection, display details..
+            if (!entity) return;
+            var geometry = entity.geometry(resolver);
 
-        menu.transition()
-            .attr('opacity', 1);
+            if (geometry === 'line' || geometry === 'area') {
+                var closed = (entity.type === 'relation') || (entity.isClosed() && !entity.isDegenerate()),
+                    feature = entity.asGeoJSON(resolver),
+                    length = radiansToMeters(d3.geo.length(toLineString(feature))),
+                    lengthLabel = t('infobox.' + (closed ? 'perimeter' : 'length')),
+                    centroid = d3.geo.centroid(feature);
 
-        var r = 50,
-            a = Math.PI / 4,
-            a0 = -Math.PI / 4,
-            a1 = a0 + (operations.length - 1) * a;
+                list.append('li')
+                    .text(t('infobox.geometry') + ': ' +
+                        (closed ? t('infobox.closed') + ' ' : '') + t('geometry.' + geometry) );
 
-        menu.append('path')
-            .attr('class', 'radial-menu-background')
-            .attr('d', 'M' + r * Math.sin(a0) + ',' +
-                             r * Math.cos(a0) +
-                      ' A' + r + ',' + r + ' 0 ' + (operations.length > 5 ? '1' : '0') + ',0 ' +
-                             (r * Math.sin(a1) + 1e-3) + ',' +
-                             (r * Math.cos(a1) + 1e-3)) // Force positive-length path (#1305)
-            .attr('stroke-width', 50)
-            .attr('stroke-linecap', 'round');
+                if (closed) {
+                    var area = steradiansToSqmeters(entity.area(resolver));
+                    list.append('li')
+                        .text(t('infobox.area') + ': ' + displayArea(area));
+                }
 
-        var button = menu.selectAll()
-            .data(operations)
-            .enter()
-            .append('g')
-            .attr('class', function(d) { return 'radial-menu-item radial-menu-item-' + d.id; })
-            .classed('disabled', function(d) { return d.disabled(); })
-            .attr('transform', function(d, i) {
-                return 'translate(' + iD.geo.roundCoords([
-                        r * Math.sin(a0 + i * a),
-                        r * Math.cos(a0 + i * a)]).join(',') + ')';
-            });
+                list.append('li')
+                    .text(lengthLabel + ': ' + displayLength(length));
 
-        button.append('circle')
-            .attr('r', 15)
-            .on('click', click)
-            .on('mousedown', mousedown)
-            .on('mouseover', mouseover)
-            .on('mouseout', mouseout);
+                list.append('li')
+                    .text(t('infobox.centroid') + ': ' + centroid[0].toFixed(5) + ', ' + centroid[1].toFixed(5));
 
-        button.append('use')
-            .attr('transform', 'translate(-10,-10)')
-            .attr('width', '20')
-            .attr('height', '20')
-            .attr('xlink:href', function(d) { return '#operation-' + d.id; });
 
-        tooltip = d3.select(document.body)
-            .append('div')
-            .attr('class', 'tooltip-inner radial-menu-tooltip');
+                var toggle  = imperial ? 'imperial' : 'metric';
+                selection.append('a')
+                    .text(t('infobox.' + toggle))
+                    .attr('href', '#')
+                    .attr('class', 'button')
+                    .on('click', function() {
+                        d3.event.preventDefault();
+                        imperial = !imperial;
+                        redraw();
+                    });
 
-        function mousedown() {
-            d3.event.stopPropagation(); // https://github.com/openstreetmap/iD/issues/1869
-        }
-
-        function mouseover(d, i) {
-            var rect = context.surfaceRect(),
-                angle = a0 + i * a,
-                top = rect.top + (r + 25) * Math.cos(angle) + center[1] + 'px',
-                left = rect.left + (r + 25) * Math.sin(angle) + center[0] + 'px',
-                bottom = rect.height - (r + 25) * Math.cos(angle) - center[1] + 'px',
-                right = rect.width - (r + 25) * Math.sin(angle) - center[0] + 'px';
-
-            tooltip
-                .style('top', null)
-                .style('left', null)
-                .style('bottom', null)
-                .style('right', null)
-                .style('display', 'block')
-                .html(iD.ui.tooltipHtml(d.tooltip(), d.keys[0]));
-
-            if (i === 0) {
-                tooltip
-                    .style('right', right)
-                    .style('top', top);
-            } else if (i >= 4) {
-                tooltip
-                    .style('left', left)
-                    .style('bottom', bottom);
             } else {
-                tooltip
-                    .style('left', left)
-                    .style('top', top);
+                var centerLabel = t('infobox.' + (entity.type === 'node' ? 'location' : 'center'));
+
+                list.append('li')
+                    .text(t('infobox.geometry') + ': ' + t('geometry.' + geometry));
+
+                list.append('li')
+                    .text(centerLabel + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
             }
         }
 
-        function mouseout() {
-            tooltip.style('display', 'none');
-        }
-    };
 
-    radialMenu.close = function() {
-        if (menu) {
-            menu
-                .style('pointer-events', 'none')
-                .transition()
-                .attr('opacity', 0)
-                .remove();
+        function hidden() {
+            return selection.style('display') === 'none';
         }
 
-        if (tooltip) {
-            tooltip.remove();
-        }
-    };
 
-    radialMenu.center = function(_) {
-        if (!arguments.length) return center;
-        center = _;
-        return radialMenu;
-    };
+        function toggle() {
+            if (d3.event) d3.event.preventDefault();
 
-    return radialMenu;
-};
-iD.ui.modal = function(selection, blocking) {
-
-    var previous = selection.select('div.modal');
-    var animate = previous.empty();
-
-    previous.transition()
-        .duration(200)
-        .style('opacity', 0)
-        .remove();
-
-    var shaded = selection
-        .append('div')
-        .attr('class', 'shaded')
-        .style('opacity', 0);
-
-    shaded.close = function() {
-        shaded
-            .transition()
-            .duration(200)
-            .style('opacity',0)
-            .remove();
-        modal
-            .transition()
-            .duration(200)
-            .style('top','0px');
-        keybinding.off();
-    };
-
-    var keybinding = d3.keybinding('modal')
-        .on('⌫', shaded.close)
-        .on('⎋', shaded.close);
-
-    d3.select(document).call(keybinding);
-
-    var modal = shaded.append('div')
-        .attr('class', 'modal fillL col6');
-
-        shaded.on('click.remove-modal', function() {
-            if (d3.event.target === this && !blocking) shaded.close();
-        });
-
-    modal.append('button')
-        .attr('class', 'close')
-        .on('click', function() {
-            if (!blocking) shaded.close();
-        })
-        .append('div')
-            .attr('class','icon close');
-
-    modal.append('div')
-        .attr('class', 'content');
-
-    if (animate) {
-        shaded.transition().style('opacity', 1);
-    } else {
-        shaded.style('opacity', 1);
-    }
-
-    return shaded;
-};
-iD.ui.Conflicts = function(context) {
-    var dispatch = d3.dispatch('download', 'cancel', 'save'),
-        list;
-
-    function conflicts(selection) {
-        var header = selection
-            .append('div')
-            .attr('class', 'header fillL');
-
-        header
-            .append('button')
-            .attr('class', 'fr')
-            .on('click', function() { dispatch.cancel(); })
-            .call(iD.svg.Icon('#icon-close'));
-
-        header
-            .append('h3')
-            .text(t('save.conflict.header'));
-
-        var body = selection
-            .append('div')
-            .attr('class', 'body fillL');
-
-        body
-            .append('div')
-            .attr('class', 'conflicts-help')
-            .text(t('save.conflict.help'))
-            .append('a')
-            .attr('class', 'conflicts-download')
-            .text(t('save.conflict.download_changes'))
-            .on('click.download', function() { dispatch.download(); });
-
-        body
-            .append('div')
-            .attr('class', 'conflict-container fillL3')
-            .call(showConflict, 0);
-
-        body
-            .append('div')
-            .attr('class', 'conflicts-done')
-            .attr('opacity', 0)
-            .style('display', 'none')
-            .text(t('save.conflict.done'));
-
-        var buttons = body
-            .append('div')
-            .attr('class','buttons col12 joined conflicts-buttons');
-
-        buttons
-            .append('button')
-            .attr('disabled', list.length > 1)
-            .attr('class', 'action conflicts-button col6')
-            .text(t('save.title'))
-            .on('click.try_again', function() { dispatch.save(); });
-
-        buttons
-            .append('button')
-            .attr('class', 'secondary-action conflicts-button col6')
-            .text(t('confirm.cancel'))
-            .on('click.cancel', function() { dispatch.cancel(); });
-    }
-
-
-    function showConflict(selection, index) {
-        if (index < 0 || index >= list.length) return;
-
-        var parent = d3.select(selection.node().parentNode);
-
-        // enable save button if this is the last conflict being reviewed..
-        if (index === list.length - 1) {
-            window.setTimeout(function() {
-                parent.select('.conflicts-button')
-                    .attr('disabled', null);
-
-                parent.select('.conflicts-done')
+            if (hidden()) {
+                selection
+                    .style('display', 'block')
+                    .style('opacity', 0)
                     .transition()
-                    .attr('opacity', 1)
-                    .style('display', 'block');
-            }, 250);
-        }
+                    .duration(200)
+                    .style('opacity', 1);
 
-        var item = selection
-            .selectAll('.conflict')
-            .data([list[index]]);
+                redraw();
 
-        var enter = item.enter()
-            .append('div')
-            .attr('class', 'conflict');
-
-        enter
-            .append('h4')
-            .attr('class', 'conflict-count')
-            .text(t('save.conflict.count', { num: index + 1, total: list.length }));
-
-        enter
-            .append('a')
-            .attr('class', 'conflict-description')
-            .attr('href', '#')
-            .text(function(d) { return d.name; })
-            .on('click', function(d) {
-                zoomToEntity(d.id);
-                d3.event.preventDefault();
-            });
-
-        var details = enter
-            .append('div')
-            .attr('class', 'conflict-detail-container');
-
-        details
-            .append('ul')
-            .attr('class', 'conflict-detail-list')
-            .selectAll('li')
-            .data(function(d) { return d.details || []; })
-            .enter()
-            .append('li')
-            .attr('class', 'conflict-detail-item')
-            .html(function(d) { return d; });
-
-        details
-            .append('div')
-            .attr('class', 'conflict-choices')
-            .call(addChoices);
-
-        details
-            .append('div')
-            .attr('class', 'conflict-nav-buttons joined cf')
-            .selectAll('button')
-            .data(['previous', 'next'])
-            .enter()
-            .append('button')
-            .text(function(d) { return t('save.conflict.' + d); })
-            .attr('class', 'conflict-nav-button action col6')
-            .attr('disabled', function(d, i) {
-                return (i === 0 && index === 0) ||
-                    (i === 1 && index === list.length - 1) || null;
-            })
-            .on('click', function(d, i) {
-                var container = parent.select('.conflict-container'),
-                sign = (i === 0 ? -1 : 1);
-
-                container
-                    .selectAll('.conflict')
-                    .remove();
-
-                container
-                    .call(showConflict, index + sign);
-
-                d3.event.preventDefault();
-            });
-
-        item.exit()
-            .remove();
-
-    }
-
-    function addChoices(selection) {
-        var choices = selection
-            .append('ul')
-            .attr('class', 'layer-list')
-            .selectAll('li')
-            .data(function(d) { return d.choices || []; });
-
-        var enter = choices.enter()
-            .append('li')
-            .attr('class', 'layer');
-
-        var label = enter
-            .append('label');
-
-        label
-            .append('input')
-            .attr('type', 'radio')
-            .attr('name', function(d) { return d.id; })
-            .on('change', function(d, i) {
-                var ul = this.parentNode.parentNode.parentNode;
-                ul.__data__.chosen = i;
-                choose(ul, d);
-            });
-
-        label
-            .append('span')
-            .text(function(d) { return d.text; });
-
-        choices
-            .each(function(d, i) {
-                var ul = this.parentNode;
-                if (ul.__data__.chosen === i) choose(ul, d);
-            });
-    }
-
-    function choose(ul, datum) {
-        if (d3.event) d3.event.preventDefault();
-
-        d3.select(ul)
-            .selectAll('li')
-            .classed('active', function(d) { return d === datum; })
-            .selectAll('input')
-            .property('checked', function(d) { return d === datum; });
-
-        var extent = iD.geo.Extent(),
-            entity;
-
-        entity = context.graph().hasEntity(datum.id);
-        if (entity) extent._extend(entity.extent(context.graph()));
-
-        datum.action();
-
-        entity = context.graph().hasEntity(datum.id);
-        if (entity) extent._extend(entity.extent(context.graph()));
-
-        zoomToEntity(datum.id, extent);
-    }
-
-    function zoomToEntity(id, extent) {
-        context.surface().selectAll('.hover')
-            .classed('hover', false);
-
-        var entity = context.graph().hasEntity(id);
-        if (entity) {
-            if (extent) {
-                context.map().trimmedExtent(extent);
             } else {
-                context.map().zoomTo(entity);
+                selection
+                    .style('display', 'block')
+                    .style('opacity', 1)
+                    .transition()
+                    .duration(200)
+                    .style('opacity', 0)
+                    .each('end', function() {
+                        d3.select(this).style('display', 'none');
+                    });
             }
-            context.surface().selectAll(
-                iD.util.entityOrMemberSelector([entity.id], context.graph()))
-                .classed('hover', true);
         }
+
+        context.map()
+            .on('drawn.info', redraw);
+
+        redraw();
+
+        var keybinding = d3.keybinding('info')
+            .on(key, toggle);
+
+        d3.select(document)
+            .call(keybinding);
     }
 
-
-    // The conflict list should be an array of objects like:
-    // {
-    //     id: id,
-    //     name: entityName(local),
-    //     details: merge.conflicts(),
-    //     chosen: 1,
-    //     choices: [
-    //         choice(id, keepMine, forceLocal),
-    //         choice(id, keepTheirs, forceRemote)
-    //     ]
-    // }
-    conflicts.list = function(_) {
-        if (!arguments.length) return list;
-        list = _;
-        return conflicts;
-    };
-
-    return d3.rebind(conflicts, dispatch, 'on');
+    return info;
 };
 iD.ui.Lasso = function(context) {
 
@@ -35258,101 +35181,36 @@ iD.ui.Lasso = function(context) {
 
     return lasso;
 };
-iD.ui.Inspector = function(context) {
-    var presetList = iD.ui.PresetList(context),
-        entityEditor = iD.ui.EntityEditor(context),
-        state = 'select',
-        entityID,
-        newFeature = false;
+iD.ui.ViewOnOSM = function(context) {
+    var id;
 
-    function inspector(selection) {
-        presetList
-            .entityID(entityID)
-            .autofocus(newFeature)
-            .on('choose', setPreset);
+    function viewOnOSM(selection) {
+        var entity = context.entity(id);
 
-        entityEditor
-            .state(state)
-            .entityID(entityID)
-            .on('choose', showList);
+        selection.style('display', entity.isNew() ? 'none' : null);
 
-        var $wrap = selection.selectAll('.panewrap')
+        var $link = selection.selectAll('.view-on-osm')
             .data([0]);
 
-        var $enter = $wrap.enter().append('div')
-            .attr('class', 'panewrap');
+        $link.enter()
+            .append('a')
+            .attr('class', 'view-on-osm')
+            .attr('target', '_blank')
+            .call(iD.svg.Icon('#icon-out-link', 'inline'))
+            .append('span')
+            .text(t('inspector.view_on_osm'));
 
-        $enter.append('div')
-            .attr('class', 'preset-list-pane pane');
-
-        $enter.append('div')
-            .attr('class', 'entity-editor-pane pane');
-
-        var $presetPane = $wrap.select('.preset-list-pane');
-        var $editorPane = $wrap.select('.entity-editor-pane');
-
-        var graph = context.graph(),
-            entity = context.entity(entityID),
-            showEditor = state === 'hover' ||
-                entity.isUsed(graph) ||
-                entity.isHighwayIntersection(graph);
-
-        if (showEditor) {
-            $wrap.style('right', '0%');
-            $editorPane.call(entityEditor);
-        } else {
-            $wrap.style('right', '-100%');
-            $presetPane.call(presetList);
-        }
-
-        var $footer = selection.selectAll('.footer')
-            .data([0]);
-
-        $footer.enter().append('div')
-            .attr('class', 'footer');
-
-        selection.select('.footer')
-            .call(iD.ui.ViewOnOSM(context)
-                .entityID(entityID));
-
-        function showList(preset) {
-            $wrap.transition()
-                .styleTween('right', function() { return d3.interpolate('0%', '-100%'); });
-
-            $presetPane.call(presetList
-                .preset(preset)
-                .autofocus(true));
-        }
-
-        function setPreset(preset) {
-            $wrap.transition()
-                .styleTween('right', function() { return d3.interpolate('-100%', '0%'); });
-
-            $editorPane.call(entityEditor
-                .preset(preset));
-        }
+        $link
+            .attr('href', context.connection().entityURL(entity));
     }
 
-    inspector.state = function(_) {
-        if (!arguments.length) return state;
-        state = _;
-        entityEditor.state(state);
-        return inspector;
+    viewOnOSM.entityID = function(_) {
+        if (!arguments.length) return id;
+        id = _;
+        return viewOnOSM;
     };
 
-    inspector.entityID = function(_) {
-        if (!arguments.length) return entityID;
-        entityID = _;
-        return inspector;
-    };
-
-    inspector.newFeature = function(_) {
-        if (!arguments.length) return newFeature;
-        newFeature = _;
-        return inspector;
-    };
-
-    return inspector;
+    return viewOnOSM;
 };
 iD.ui.MapInMap = function(context) {
     var key = '/';
@@ -35657,231 +35515,6 @@ iD.ui.MapInMap = function(context) {
 
     return map_in_map;
 };
-iD.ui.Info = function(context) {
-    var key = iD.ui.cmd('⌘I'),
-        imperial = (iD.detect().locale.toLowerCase() === 'en-us');
-
-    function info(selection) {
-        function radiansToMeters(r) {
-            // using WGS84 authalic radius (6371007.1809 m)
-            return r * 6371007.1809;
-        }
-
-        function steradiansToSqmeters(r) {
-            // http://gis.stackexchange.com/a/124857/40446
-            return r / 12.56637 * 510065621724000;
-        }
-
-        function toLineString(feature) {
-            if (feature.type === 'LineString') return feature;
-
-            var result = { type: 'LineString', coordinates: [] };
-            if (feature.type === 'Polygon') {
-                result.coordinates = feature.coordinates[0];
-            } else if (feature.type === 'MultiPolygon') {
-                result.coordinates = feature.coordinates[0][0];
-            }
-
-            return result;
-        }
-
-        function displayLength(m) {
-            var d = m * (imperial ? 3.28084 : 1),
-                p, unit;
-
-            if (imperial) {
-                if (d >= 5280) {
-                    d /= 5280;
-                    unit = 'mi';
-                } else {
-                    unit = 'ft';
-                }
-            } else {
-                if (d >= 1000) {
-                    d /= 1000;
-                    unit = 'km';
-                } else {
-                    unit = 'm';
-                }
-            }
-
-            // drop unnecessary precision
-            p = d > 1000 ? 0 : d > 100 ? 1 : 2;
-
-            return String(d.toFixed(p)) + ' ' + unit;
-        }
-
-        function displayArea(m2) {
-            var d = m2 * (imperial ? 10.7639111056 : 1),
-                d1, d2, p1, p2, unit1, unit2;
-
-            if (imperial) {
-                if (d >= 6969600) {     // > 0.25mi² show mi²
-                    d1 = d / 27878400;
-                    unit1 = 'mi²';
-                } else {
-                    d1 = d;
-                    unit1 = 'ft²';
-                }
-
-                if (d > 4356 && d < 43560000) {   // 0.1 - 1000 acres
-                    d2 = d / 43560;
-                    unit2 = 'ac';
-                }
-
-            } else {
-                if (d >= 250000) {    // > 0.25km² show km²
-                    d1 = d / 1000000;
-                    unit1 = 'km²';
-                } else {
-                    d1 = d;
-                    unit1 = 'm²';
-                }
-
-                if (d > 1000 && d < 10000000) {   // 0.1 - 1000 hectares
-                    d2 = d / 10000;
-                    unit2 = 'ha';
-                }
-            }
-
-            // drop unnecessary precision
-            p1 = d1 > 1000 ? 0 : d1 > 100 ? 1 : 2;
-            p2 = d2 > 1000 ? 0 : d2 > 100 ? 1 : 2;
-
-            return String(d1.toFixed(p1)) + ' ' + unit1 +
-                (d2 ? ' (' + String(d2.toFixed(p2)) + ' ' + unit2 + ')' : '');
-        }
-
-
-        function redraw() {
-            if (hidden()) return;
-
-            var resolver = context.graph(),
-                selected = _.filter(context.selectedIDs(), function(e) { return context.hasEntity(e); }),
-                singular = selected.length === 1 ? selected[0] : null,
-                extent = iD.geo.Extent(),
-                entity;
-
-            selection.html('');
-            selection.append('h4')
-                .attr('class', 'selection-heading fillD')
-                .text(singular || t('infobox.selected', { n: selected.length }));
-
-            if (!selected.length) return;
-
-            var center;
-            for (var i = 0; i < selected.length; i++) {
-                entity = context.entity(selected[i]);
-                extent._extend(entity.extent(resolver));
-            }
-            center = extent.center();
-
-
-            var list = selection.append('ul');
-
-            // multiple selection, just display extent center..
-            if (!singular) {
-                list.append('li')
-                    .text(t('infobox.center') + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
-                return;
-            }
-
-            // single selection, display details..
-            if (!entity) return;
-            var geometry = entity.geometry(resolver);
-
-            if (geometry === 'line' || geometry === 'area') {
-                var closed = (entity.type === 'relation') || (entity.isClosed() && !entity.isDegenerate()),
-                    feature = entity.asGeoJSON(resolver),
-                    length = radiansToMeters(d3.geo.length(toLineString(feature))),
-                    lengthLabel = t('infobox.' + (closed ? 'perimeter' : 'length')),
-                    centroid = d3.geo.centroid(feature);
-
-                list.append('li')
-                    .text(t('infobox.geometry') + ': ' +
-                        (closed ? t('infobox.closed') + ' ' : '') + t('geometry.' + geometry) );
-
-                if (closed) {
-                    var area = steradiansToSqmeters(entity.area(resolver));
-                    list.append('li')
-                        .text(t('infobox.area') + ': ' + displayArea(area));
-                }
-
-                list.append('li')
-                    .text(lengthLabel + ': ' + displayLength(length));
-
-                list.append('li')
-                    .text(t('infobox.centroid') + ': ' + centroid[0].toFixed(5) + ', ' + centroid[1].toFixed(5));
-
-
-                var toggle  = imperial ? 'imperial' : 'metric';
-                selection.append('a')
-                    .text(t('infobox.' + toggle))
-                    .attr('href', '#')
-                    .attr('class', 'button')
-                    .on('click', function() {
-                        d3.event.preventDefault();
-                        imperial = !imperial;
-                        redraw();
-                    });
-
-            } else {
-                var centerLabel = t('infobox.' + (entity.type === 'node' ? 'location' : 'center'));
-
-                list.append('li')
-                    .text(t('infobox.geometry') + ': ' + t('geometry.' + geometry));
-
-                list.append('li')
-                    .text(centerLabel + ': ' + center[0].toFixed(5) + ', ' + center[1].toFixed(5));
-            }
-        }
-
-
-        function hidden() {
-            return selection.style('display') === 'none';
-        }
-
-
-        function toggle() {
-            if (d3.event) d3.event.preventDefault();
-
-            if (hidden()) {
-                selection
-                    .style('display', 'block')
-                    .style('opacity', 0)
-                    .transition()
-                    .duration(200)
-                    .style('opacity', 1);
-
-                redraw();
-
-            } else {
-                selection
-                    .style('display', 'block')
-                    .style('opacity', 1)
-                    .transition()
-                    .duration(200)
-                    .style('opacity', 0)
-                    .each('end', function() {
-                        d3.select(this).style('display', 'none');
-                    });
-            }
-        }
-
-        context.map()
-            .on('drawn.info', redraw);
-
-        redraw();
-
-        var keybinding = d3.keybinding('info')
-            .on(key, toggle);
-
-        d3.select(document)
-            .call(keybinding);
-    }
-
-    return info;
-};
 iD.ui.Loading = function(context) {
     var message = '',
         blocking = false,
@@ -35926,93 +35559,161 @@ iD.ui.Loading = function(context) {
 
     return loading;
 };
-iD.ui.Sidebar = function(context) {
-    var inspector = iD.ui.Inspector(context),
-        current;
+iD.ui.Help = function(context) {
+    var key = 'H';
 
-    function sidebar(selection) {
-        var text = '<img src="https://strava.github.io/api/images/logo.png" style="height: 24px">';
-        text += '<div style="float:right; font-weight: bold; margin-top: 3px">Includes the <a href="http://labs.strava.com/slide" target="_blank">Slide add-on</a> &nbsp; </div>';
-        selection.append('div')
-            .style({position: 'absolute', 'z-index': 1000, width: '400px'})
-            .html(text);
+    var docKeys = [
+        'help.help',
+        'help.editing_saving',
+        'help.roads',
+        'help.gps',
+        'help.imagery',
+        'help.addresses',
+        'help.inspector',
+        'help.buildings',
+        'help.relations'];
 
-        var featureListWrap = selection.append('div')
-            .attr('class', 'feature-list-pane')
-            .call(iD.ui.FeatureList(context));
+    var docs = docKeys.map(function(key) {
+        var text = t(key);
+        return {
+            title: text.split('\n')[0].replace('#', '').trim(),
+            html: marked(text.split('\n').slice(1).join('\n'))
+        };
+    });
 
-        selection.call(iD.ui.Notice(context));
+    function help(selection) {
 
-        var inspectorWrap = selection.append('div')
-            .attr('class', 'inspector-hidden inspector-wrap fr');
+        function hide() {
+            setVisible(false);
+        }
 
-        function hover(id) {
-            if (!current && context.hasEntity(id)) {
-                featureListWrap.classed('inspector-hidden', true);
-                inspectorWrap.classed('inspector-hidden', false)
-                    .classed('inspector-hover', true);
+        function toggle() {
+            if (d3.event) d3.event.preventDefault();
+            tooltip.hide(button);
+            setVisible(!button.classed('active'));
+        }
 
-                if (inspector.entityID() !== id || inspector.state() !== 'hover') {
-                    inspector
-                        .state('hover')
-                        .entityID(id);
+        function setVisible(show) {
+            if (show !== shown) {
+                button.classed('active', show);
+                shown = show;
 
-                    inspectorWrap.call(inspector);
+                if (show) {
+                    selection.on('mousedown.help-inside', function() {
+                        return d3.event.stopPropagation();
+                    });
+                    pane.style('display', 'block')
+                        .style('right', '-500px')
+                        .transition()
+                        .duration(200)
+                        .style('right', '0px');
+                } else {
+                    pane.style('right', '0px')
+                        .transition()
+                        .duration(200)
+                        .style('right', '-500px')
+                        .each('end', function() {
+                            d3.select(this).style('display', 'none');
+                        });
+                    selection.on('mousedown.help-inside', null);
                 }
-            } else if (!current) {
-                featureListWrap.classed('inspector-hidden', false);
-                inspectorWrap.classed('inspector-hidden', true);
-                inspector.state('hide');
             }
         }
 
-        sidebar.hover = _.throttle(hover, 200);
+        function clickHelp(d, i) {
+            pane.property('scrollTop', 0);
+            doctitle.html(d.title);
+            body.html(d.html);
+            body.selectAll('a')
+                .attr('target', '_blank');
+            menuItems.classed('selected', function(m) {
+                return m.title === d.title;
+            });
 
-        sidebar.select = function(id, newFeature) {
-            if (!current && id) {
-                featureListWrap.classed('inspector-hidden', true);
-                inspectorWrap.classed('inspector-hidden', false)
-                    .classed('inspector-hover', false);
+            nav.html('');
 
-                if (inspector.entityID() !== id || inspector.state() !== 'select') {
-                    inspector
-                        .state('select')
-                        .entityID(id)
-                        .newFeature(newFeature);
-
-                    inspectorWrap.call(inspector);
-                }
-            } else if (!current) {
-                featureListWrap.classed('inspector-hidden', false);
-                inspectorWrap.classed('inspector-hidden', true);
-                inspector.state('hide');
+            if (i > 0) {
+                var prevLink = nav.append('a')
+                    .attr('class', 'previous')
+                    .on('click', function() {
+                        clickHelp(docs[i - 1], i - 1);
+                    });
+                prevLink.append('span').html('&#9668; ' + docs[i - 1].title);
             }
-        };
+            if (i < docs.length - 1) {
+                var nextLink = nav.append('a')
+                    .attr('class', 'next')
+                    .on('click', function() {
+                        clickHelp(docs[i + 1], i + 1);
+                    });
+                nextLink.append('span').html(docs[i + 1].title + ' &#9658;');
+            }
+        }
 
-        sidebar.show = function(component) {
-            featureListWrap.classed('inspector-hidden', true);
-            inspectorWrap.classed('inspector-hidden', true);
-            if (current) current.remove();
-            current = selection.append('div')
-                .attr('class', 'sidebar-component')
-                .call(component);
-        };
+        function clickWalkthrough() {
+            d3.select(document.body).call(iD.ui.intro(context));
+            setVisible(false);
+        }
 
-        sidebar.hide = function() {
-            featureListWrap.classed('inspector-hidden', false);
-            inspectorWrap.classed('inspector-hidden', true);
-            if (current) current.remove();
-            current = null;
-        };
+
+        var pane = selection.append('div')
+                .attr('class', 'help-wrap map-overlay fillL col5 content hide'),
+            tooltip = bootstrap.tooltip()
+                .placement('left')
+                .html(true)
+                .title(iD.ui.tooltipHtml(t('help.title'), key)),
+            button = selection.append('button')
+                .attr('tabindex', -1)
+                .on('click', toggle)
+                .call(iD.svg.Icon('#icon-help', 'light'))
+                .call(tooltip),
+            shown = false;
+
+
+        var toc = pane.append('ul')
+            .attr('class', 'toc');
+
+        var menuItems = toc.selectAll('li')
+            .data(docs)
+            .enter()
+            .append('li')
+            .append('a')
+            .html(function(d) { return d.title; })
+            .on('click', clickHelp);
+
+        toc.append('li')
+            .attr('class','walkthrough')
+            .append('a')
+            .text(t('splash.walkthrough'))
+            .on('click', clickWalkthrough);
+
+        var content = pane.append('div')
+            .attr('class', 'left-content');
+
+        var doctitle = content.append('h2')
+            .text(t('help.title'));
+
+        var body = content.append('div')
+            .attr('class', 'body');
+
+        var nav = content.append('div')
+            .attr('class', 'nav');
+
+        clickHelp(docs[0], 0);
+
+        var keybinding = d3.keybinding('help')
+            .on(key, toggle)
+            .on('B', hide)
+            .on('F', hide);
+
+        d3.select(document)
+            .call(keybinding);
+
+        context.surface().on('mousedown.help-outside', hide);
+        context.container().on('mousedown.help-outside', hide);
     }
 
-    sidebar.hover = function() {};
-    sidebar.hover.cancel = function() {};
-    sidebar.select = function() {};
-    sidebar.show = function() {};
-    sidebar.hide = function() {};
-
-    return sidebar;
+    return help;
 };
 iD.ui.Save = function(context) {
     var history = context.history(),
@@ -36080,247 +35781,307 @@ iD.ui.Save = function(context) {
         });
     };
 };
-iD.ui.PresetList = function(context) {
-    var event = d3.dispatch('choose'),
-        id,
-        currentPreset,
-        autofocus = false;
+iD.ui.Restore = function(context) {
+    return function(selection) {
+        if (!context.history().lock() || !context.history().restorableChanges())
+            return;
 
-    function presetList(selection) {
-        var geometry = context.geometry(id),
-            presets = context.presets().matchGeometry(geometry);
+        var modal = iD.ui.modal(selection);
 
-        selection.html('');
+        modal.select('.modal')
+            .attr('class', 'modal fillL col6');
 
-        var messagewrap = selection.append('div')
+        var introModal = modal.select('.content');
+
+        introModal.attr('class','cf');
+
+        introModal.append('div')
+            .attr('class', 'modal-section')
+            .append('h3')
+            .text(t('restore.heading'));
+
+        introModal.append('div')
+            .attr('class','modal-section')
+            .append('p')
+            .text(t('restore.description'));
+
+        var buttonWrap = introModal.append('div')
+            .attr('class', 'modal-actions cf');
+
+        var restore = buttonWrap.append('button')
+            .attr('class', 'restore col6')
+            .text(t('restore.restore'))
+            .on('click', function() {
+                context.history().restore();
+                modal.remove();
+            });
+
+        buttonWrap.append('button')
+            .attr('class', 'reset col6')
+            .text(t('restore.reset'))
+            .on('click', function() {
+                context.history().clearSaved();
+                modal.remove();
+            });
+
+        restore.node().focus();
+    };
+};
+iD.ui.FeatureList = function(context) {
+    var geocodeResults;
+
+    function featureList(selection) {
+        var header = selection.append('div')
             .attr('class', 'header fillL cf');
 
-        var message = messagewrap.append('h3')
-            .text(t('inspector.choose'));
-
-        if (context.entity(id).isUsed(context.graph())) {
-            messagewrap.append('button')
-                .attr('class', 'preset-choose')
-                .on('click', function() { event.choose(currentPreset); })
-                .append('span')
-                .html('&#9658;');
-        } else {
-            messagewrap.append('button')
-                .attr('class', 'close')
-                .on('click', function() {
-                    context.enter(iD.modes.Browse(context));
-                })
-                .call(iD.svg.Icon('#icon-close'));
-        }
-
-        function keydown() {
-            // hack to let delete shortcut work when search is autofocused
-            if (search.property('value').length === 0 &&
-                (d3.event.keyCode === d3.keybinding.keyCodes['⌫'] ||
-                 d3.event.keyCode === d3.keybinding.keyCodes['⌦'])) {
-                d3.event.preventDefault();
-                d3.event.stopPropagation();
-                iD.operations.Delete([id], context)();
-            } else if (search.property('value').length === 0 &&
-                (d3.event.ctrlKey || d3.event.metaKey) &&
-                d3.event.keyCode === d3.keybinding.keyCodes.z) {
-                d3.event.preventDefault();
-                d3.event.stopPropagation();
-                context.undo();
-            } else if (!d3.event.ctrlKey && !d3.event.metaKey) {
-                d3.select(this).on('keydown', null);
-            }
-        }
+        header.append('h3')
+            .text(t('inspector.feature_list'));
 
         function keypress() {
-            // enter
-            var value = search.property('value');
-            if (d3.event.keyCode === 13 && value.length) {
-                list.selectAll('.preset-list-item:first-child').datum().choose();
+            var q = search.property('value'),
+                items = list.selectAll('.feature-list-item');
+            if (d3.event.keyCode === 13 && q.length && items.size()) {
+                click(items.datum());
             }
         }
 
         function inputevent() {
-            var value = search.property('value');
-            list.classed('filtered', value.length);
-            if (value.length) {
-                var results = presets.search(value, geometry);
-                message.text(t('inspector.results', {
-                    n: results.collection.length,
-                    search: value
-                }));
-                list.call(drawList, results);
-            } else {
-                list.call(drawList, context.presets().defaults(geometry, 36));
-                message.text(t('inspector.choose'));
-            }
+            geocodeResults = undefined;
+            drawList();
         }
 
         var searchWrap = selection.append('div')
             .attr('class', 'search-header');
 
         var search = searchWrap.append('input')
-            .attr('class', 'preset-search-input')
             .attr('placeholder', t('inspector.search'))
             .attr('type', 'search')
-            .on('keydown', keydown)
             .on('keypress', keypress)
             .on('input', inputevent);
 
         searchWrap
             .call(iD.svg.Icon('#icon-search', 'pre-text'));
 
-        if (autofocus) {
-            search.node().focus();
-        }
-
         var listWrap = selection.append('div')
             .attr('class', 'inspector-body');
 
         var list = listWrap.append('div')
-            .attr('class', 'preset-list fillL cf')
-            .call(drawList, context.presets().defaults(geometry, 36));
-    }
+            .attr('class', 'feature-list cf');
 
-    function drawList(list, presets) {
-        var collection = presets.collection.map(function(preset) {
-            return preset.members ? CategoryItem(preset) : PresetItem(preset);
-        });
+        context
+            .on('exit.feature-list', clearSearch);
+        context.map()
+            .on('drawn.feature-list', mapDrawn);
 
-        var items = list.selectAll('.preset-list-item')
-            .data(collection, function(d) { return d.preset.id; });
-
-        items.enter().append('div')
-            .attr('class', function(item) { return 'preset-list-item preset-' + item.preset.id.replace('/', '-'); })
-            .classed('current', function(item) { return item.preset === currentPreset; })
-            .each(function(item) {
-                d3.select(this).call(item);
-            })
-            .style('opacity', 0)
-            .transition()
-            .style('opacity', 1);
-
-        items.order();
-
-        items.exit()
-            .remove();
-    }
-
-    function CategoryItem(preset) {
-        var box, sublist, shown = false;
-
-        function item(selection) {
-            var wrap = selection.append('div')
-                .attr('class', 'preset-list-button-wrap category col12');
-
-            wrap.append('button')
-                .attr('class', 'preset-list-button')
-                .call(iD.ui.PresetIcon()
-                    .geometry(context.geometry(id))
-                    .preset(preset))
-                .on('click', item.choose)
-                .append('div')
-                .attr('class', 'label')
-                .text(preset.name());
-
-            box = selection.append('div')
-                .attr('class', 'subgrid col12')
-                .style('max-height', '0px')
-                .style('opacity', 0);
-
-            box.append('div')
-                .attr('class', 'arrow');
-
-            sublist = box.append('div')
-                .attr('class', 'preset-list fillL3 cf fl');
+        function clearSearch() {
+            search.property('value', '');
+            drawList();
         }
 
-        item.choose = function() {
-            if (!box || !sublist) return;
-
-            if (shown) {
-                shown = false;
-                box.transition()
-                    .duration(200)
-                    .style('opacity', '0')
-                    .style('max-height', '0px')
-                    .style('padding-bottom', '0px');
-            } else {
-                shown = true;
-                sublist.call(drawList, preset.members);
-                box.transition()
-                    .duration(200)
-                    .style('opacity', '1')
-                    .style('max-height', 200 + preset.members.collection.length * 80 + 'px')
-                    .style('padding-bottom', '20px');
+        function mapDrawn(e) {
+            if (e.full) {
+                drawList();
             }
-        };
-
-        item.preset = preset;
-
-        return item;
-    }
-
-    function PresetItem(preset) {
-        function item(selection) {
-            var wrap = selection.append('div')
-                .attr('class', 'preset-list-button-wrap col12');
-
-            wrap.append('button')
-                .attr('class', 'preset-list-button')
-                .call(iD.ui.PresetIcon()
-                    .geometry(context.geometry(id))
-                    .preset(preset))
-                .on('click', item.choose)
-                .append('div')
-                .attr('class', 'label')
-                .text(preset.name());
-
-            wrap.call(item.reference.button);
-            selection.call(item.reference.body);
         }
 
-        item.choose = function() {
-            context.presets().choose(preset);
+        function features() {
+            var entities = {},
+                result = [],
+                graph = context.graph(),
+                q = search.property('value').toLowerCase();
 
-            context.perform(
-                iD.actions.ChangePreset(id, currentPreset, preset),
-                t('operations.change_tags.annotation'));
+            if (!q) return result;
 
-            event.choose(preset);
-        };
+            var idMatch = q.match(/^([nwr])([0-9]+)$/);
 
-        item.help = function() {
-            d3.event.stopPropagation();
-            item.reference.toggle();
-        };
+            if (idMatch) {
+                result.push({
+                    id: idMatch[0],
+                    geometry: idMatch[1] === 'n' ? 'point' : idMatch[1] === 'w' ? 'line' : 'relation',
+                    type: idMatch[1] === 'n' ? t('inspector.node') : idMatch[1] === 'w' ? t('inspector.way') : t('inspector.relation'),
+                    name: idMatch[2]
+                });
+            }
 
-        item.preset = preset;
-        item.reference = iD.ui.TagReference(preset.reference(context.geometry(id)), context);
+            var locationMatch = sexagesimal.pair(q.toUpperCase()) || q.match(/^(-?\d+\.?\d*)\s+(-?\d+\.?\d*)$/);
 
-        return item;
+            if (locationMatch) {
+                var loc = [parseFloat(locationMatch[0]), parseFloat(locationMatch[1])];
+                result.push({
+                    id: -1,
+                    geometry: 'point',
+                    type: t('inspector.location'),
+                    name: loc[0].toFixed(6) + ', ' + loc[1].toFixed(6),
+                    location: loc
+                });
+            }
+
+            function addEntity(entity) {
+                if (entity.id in entities || result.length > 200)
+                    return;
+
+                entities[entity.id] = true;
+
+                var name = iD.util.displayName(entity) || '';
+                if (name.toLowerCase().indexOf(q) >= 0) {
+                    result.push({
+                        id: entity.id,
+                        entity: entity,
+                        geometry: context.geometry(entity.id),
+                        type: context.presets().match(entity, graph).name(),
+                        name: name
+                    });
+                }
+
+                graph.parentRelations(entity).forEach(function(parent) {
+                    addEntity(parent);
+                });
+            }
+
+            var visible = context.surface().selectAll('.point, .line, .area')[0];
+            for (var i = 0; i < visible.length && result.length <= 200; i++) {
+                addEntity(visible[i].__data__);
+            }
+
+            (geocodeResults || []).forEach(function(d) {
+                // https://github.com/openstreetmap/iD/issues/1890
+                if (d.osm_type && d.osm_id) {
+                    result.push({
+                        id: iD.Entity.id.fromOSM(d.osm_type, d.osm_id),
+                        geometry: d.osm_type === 'relation' ? 'relation' : d.osm_type === 'way' ? 'line' : 'point',
+                        type: d.type !== 'yes' ? (d.type.charAt(0).toUpperCase() + d.type.slice(1)).replace('_', ' ')
+                                               : (d.class.charAt(0).toUpperCase() + d.class.slice(1)).replace('_', ' '),
+                        name: d.display_name,
+                        extent: new iD.geo.Extent(
+                            [parseFloat(d.boundingbox[3]), parseFloat(d.boundingbox[0])],
+                            [parseFloat(d.boundingbox[2]), parseFloat(d.boundingbox[1])])
+                    });
+                }
+            });
+
+            return result;
+        }
+
+        function drawList() {
+            var value = search.property('value'),
+                results = features();
+
+            list.classed('filtered', value.length);
+
+            var noResultsWorldwide = geocodeResults && geocodeResults.length === 0;
+
+            var resultsIndicator = list.selectAll('.no-results-item')
+                .data([0])
+                .enter().append('button')
+                .property('disabled', true)
+                .attr('class', 'no-results-item')
+                .call(iD.svg.Icon('#icon-alert', 'pre-text'));
+
+            resultsIndicator.append('span')
+                .attr('class', 'entity-name');
+
+            list.selectAll('.no-results-item .entity-name')
+                .text(noResultsWorldwide ? t('geocoder.no_results_worldwide') : t('geocoder.no_results_visible'));
+
+            list.selectAll('.geocode-item')
+                .data([0])
+                .enter().append('button')
+                .attr('class', 'geocode-item')
+                .on('click', geocode)
+                .append('div')
+                .attr('class', 'label')
+                .append('span')
+                .attr('class', 'entity-name')
+                .text(t('geocoder.search'));
+
+            list.selectAll('.no-results-item')
+                .style('display', (value.length && !results.length) ? 'block' : 'none');
+
+            list.selectAll('.geocode-item')
+                .style('display', (value && geocodeResults === undefined) ? 'block' : 'none');
+
+            list.selectAll('.feature-list-item')
+                .data([-1])
+                .remove();
+
+            var items = list.selectAll('.feature-list-item')
+                .data(results, function(d) { return d.id; });
+
+            var enter = items.enter()
+                .insert('button', '.geocode-item')
+                .attr('class', 'feature-list-item')
+                .on('mouseover', mouseover)
+                .on('mouseout', mouseout)
+                .on('click', click);
+
+            var label = enter
+                .append('div')
+                .attr('class', 'label');
+
+            label.each(function(d) {
+                d3.select(this)
+                    .call(iD.svg.Icon('#icon-' + d.geometry, 'pre-text'));
+            });
+
+            label.append('span')
+                .attr('class', 'entity-type')
+                .text(function(d) { return d.type; });
+
+            label.append('span')
+                .attr('class', 'entity-name')
+                .text(function(d) { return d.name; });
+
+            enter.style('opacity', 0)
+                .transition()
+                .style('opacity', 1);
+
+            items.order();
+
+            items.exit()
+                .remove();
+        }
+
+        function mouseover(d) {
+            if (d.id === -1) return;
+
+            context.surface().selectAll(iD.util.entityOrMemberSelector([d.id], context.graph()))
+                .classed('hover', true);
+        }
+
+        function mouseout() {
+            context.surface().selectAll('.hover')
+                .classed('hover', false);
+        }
+
+        function click(d) {
+            d3.event.preventDefault();
+            if (d.location) {
+                context.map().centerZoom([d.location[1], d.location[0]], 20);
+            }
+            else if (d.entity) {
+                if (d.entity.type === 'node') {
+                    context.map().center(d.entity.loc);
+                } else if (d.entity.type === 'way') {
+                    var center = context.projection(context.map().center()),
+                        edge = iD.geo.chooseEdge(context.childNodes(d.entity), center, context.projection);
+                    context.map().center(edge.loc);
+                }
+                context.enter(iD.modes.Select(context, [d.entity.id]).suppressMenu(true));
+            } else {
+                context.zoomToEntity(d.id);
+            }
+        }
+
+        function geocode() {
+            var searchVal = encodeURIComponent(search.property('value'));
+            d3.json('https://nominatim.openstreetmap.org/search/' + searchVal + '?limit=10&format=json', function(err, resp) {
+                geocodeResults = resp || [];
+                drawList();
+            });
+        }
     }
 
-    presetList.autofocus = function(_) {
-        if (!arguments.length) return autofocus;
-        autofocus = _;
-        return presetList;
-    };
-
-    presetList.entityID = function(_) {
-        if (!arguments.length) return id;
-        id = _;
-        presetList.preset(context.presets().match(context.entity(id), context.graph()));
-        return presetList;
-    };
-
-    presetList.preset = function(_) {
-        if (!arguments.length) return currentPreset;
-        currentPreset = _;
-        return presetList;
-    };
-
-    return d3.rebind(presetList, event, 'on');
+    return featureList;
 };
 iD.ui.Account = function(context) {
     var connection = context.connection();
@@ -36772,49 +36533,6 @@ iD.ui.preset = function(context) {
 
     return d3.rebind(presets, event, 'on');
 };
-iD.ui.Splash = function(context) {
-    return function(selection) {
-        if (context.storage('sawSplash'))
-             return;
-
-        context.storage('sawSplash', true);
-
-        var modal = iD.ui.modal(selection);
-
-        modal.select('.modal')
-            .attr('class', 'modal-splash modal col6');
-
-        var introModal = modal.select('.content')
-            .append('div')
-            .attr('class', 'fillL');
-
-        introModal.append('div')
-            .attr('class','modal-section cf')
-            .append('h3').text(t('splash.welcome'));
-
-        introModal.append('div')
-            .attr('class','modal-section')
-            .append('p')
-            .html(t('splash.text'));
-
-        var buttons = introModal.append('div').attr('class', 'modal-actions cf');
-
-        buttons.append('button')
-            .attr('class', 'col6')
-            .text(t('splash.walkthrough'))
-            .on('click', function() {
-                window.location = 'http://labs.strava.com/slide';
-            });
-
-        buttons.append('button')
-            .attr('class', 'col6 start')
-            .text(t('splash.start'))
-            .on('click', modal.close);
-
-        modal.select('button.close').attr('class','hide');
-
-    };
-};
 iD.ui.Attribution = function(context) {
     var selection;
 
@@ -36895,29 +36613,69 @@ iD.ui.Attribution = function(context) {
         update();
     };
 };
-iD.ui.Notice = function(context) {
+iD.ui.UndoRedo = function(context) {
+    var commands = [{
+        id: 'undo',
+        cmd: iD.ui.cmd('⌘Z'),
+        action: function() { if (!(context.inIntro() || saving())) context.undo(); },
+        annotation: function() { return context.history().undoAnnotation(); }
+    }, {
+        id: 'redo',
+        cmd: iD.ui.cmd('⌘⇧Z'),
+        action: function() {if (!(context.inIntro() || saving())) context.redo(); },
+        annotation: function() { return context.history().redoAnnotation(); }
+    }];
+
+    function saving() {
+        return context.mode().id === 'save';
+    }
+
     return function(selection) {
-        var div = selection.append('div')
-            .attr('class', 'notice');
+        var tooltip = bootstrap.tooltip()
+            .placement('bottom')
+            .html(true)
+            .title(function (d) {
+                return iD.ui.tooltipHtml(d.annotation() ?
+                    t(d.id + '.tooltip', {action: d.annotation()}) :
+                    t(d.id + '.nothing'), d.cmd);
+            });
 
-        var button = div.append('button')
-            .attr('class', 'zoom-to notice')
-            .on('click', function() { context.map().zoom(context.minEditableZoom()); });
+        var buttons = selection.selectAll('button')
+            .data(commands)
+            .enter().append('button')
+            .attr('class', 'col6 disabled')
+            .on('click', function(d) { return d.action(); })
+            .call(tooltip);
 
-        button
-            .call(iD.svg.Icon('#icon-plus', 'pre-text'))
-            .append('span')
-            .attr('class', 'label')
-            .text(t('zoom_in_edit'));
+        buttons.each(function(d) {
+            d3.select(this)
+                .call(iD.svg.Icon('#icon-' + d.id));
+        });
 
-        function disableTooHigh() {
-            div.style('display', context.editable() ? 'none' : 'block');
+        var keybinding = d3.keybinding('undo')
+            .on(commands[0].cmd, function() { d3.event.preventDefault(); commands[0].action(); })
+            .on(commands[1].cmd, function() { d3.event.preventDefault(); commands[1].action(); });
+
+        d3.select(document)
+            .call(keybinding);
+
+        context.history()
+            .on('change.undo_redo', update);
+
+        context
+            .on('enter.undo_redo', update);
+
+        function update() {
+            buttons
+                .property('disabled', saving())
+                .classed('disabled', function(d) { return !d.annotation(); })
+                .each(function() {
+                    var selection = d3.select(this);
+                    if (selection.property('tooltipVisible')) {
+                        selection.call(tooltip.show);
+                    }
+                });
         }
-
-        context.map()
-            .on('move.notice', _.debounce(disableTooHigh, 500));
-
-        disableTooHigh();
     };
 };
 // Translate a MacOS key command into the appropriate Windows/Linux equivalent.
@@ -36949,6 +36707,248 @@ iD.ui.cmd = function(code) {
     }
 
     return result;
+};
+iD.ui.PresetList = function(context) {
+    var event = d3.dispatch('choose'),
+        id,
+        currentPreset,
+        autofocus = false;
+
+    function presetList(selection) {
+        var geometry = context.geometry(id),
+            presets = context.presets().matchGeometry(geometry);
+
+        selection.html('');
+
+        var messagewrap = selection.append('div')
+            .attr('class', 'header fillL cf');
+
+        var message = messagewrap.append('h3')
+            .text(t('inspector.choose'));
+
+        if (context.entity(id).isUsed(context.graph())) {
+            messagewrap.append('button')
+                .attr('class', 'preset-choose')
+                .on('click', function() { event.choose(currentPreset); })
+                .append('span')
+                .html('&#9658;');
+        } else {
+            messagewrap.append('button')
+                .attr('class', 'close')
+                .on('click', function() {
+                    context.enter(iD.modes.Browse(context));
+                })
+                .call(iD.svg.Icon('#icon-close'));
+        }
+
+        function keydown() {
+            // hack to let delete shortcut work when search is autofocused
+            if (search.property('value').length === 0 &&
+                (d3.event.keyCode === d3.keybinding.keyCodes['⌫'] ||
+                 d3.event.keyCode === d3.keybinding.keyCodes['⌦'])) {
+                d3.event.preventDefault();
+                d3.event.stopPropagation();
+                iD.operations.Delete([id], context)();
+            } else if (search.property('value').length === 0 &&
+                (d3.event.ctrlKey || d3.event.metaKey) &&
+                d3.event.keyCode === d3.keybinding.keyCodes.z) {
+                d3.event.preventDefault();
+                d3.event.stopPropagation();
+                context.undo();
+            } else if (!d3.event.ctrlKey && !d3.event.metaKey) {
+                d3.select(this).on('keydown', null);
+            }
+        }
+
+        function keypress() {
+            // enter
+            var value = search.property('value');
+            if (d3.event.keyCode === 13 && value.length) {
+                list.selectAll('.preset-list-item:first-child').datum().choose();
+            }
+        }
+
+        function inputevent() {
+            var value = search.property('value');
+            list.classed('filtered', value.length);
+            if (value.length) {
+                var results = presets.search(value, geometry);
+                message.text(t('inspector.results', {
+                    n: results.collection.length,
+                    search: value
+                }));
+                list.call(drawList, results);
+            } else {
+                list.call(drawList, context.presets().defaults(geometry, 36));
+                message.text(t('inspector.choose'));
+            }
+        }
+
+        var searchWrap = selection.append('div')
+            .attr('class', 'search-header');
+
+        var search = searchWrap.append('input')
+            .attr('class', 'preset-search-input')
+            .attr('placeholder', t('inspector.search'))
+            .attr('type', 'search')
+            .on('keydown', keydown)
+            .on('keypress', keypress)
+            .on('input', inputevent);
+
+        searchWrap
+            .call(iD.svg.Icon('#icon-search', 'pre-text'));
+
+        if (autofocus) {
+            search.node().focus();
+        }
+
+        var listWrap = selection.append('div')
+            .attr('class', 'inspector-body');
+
+        var list = listWrap.append('div')
+            .attr('class', 'preset-list fillL cf')
+            .call(drawList, context.presets().defaults(geometry, 36));
+    }
+
+    function drawList(list, presets) {
+        var collection = presets.collection.map(function(preset) {
+            return preset.members ? CategoryItem(preset) : PresetItem(preset);
+        });
+
+        var items = list.selectAll('.preset-list-item')
+            .data(collection, function(d) { return d.preset.id; });
+
+        items.enter().append('div')
+            .attr('class', function(item) { return 'preset-list-item preset-' + item.preset.id.replace('/', '-'); })
+            .classed('current', function(item) { return item.preset === currentPreset; })
+            .each(function(item) {
+                d3.select(this).call(item);
+            })
+            .style('opacity', 0)
+            .transition()
+            .style('opacity', 1);
+
+        items.order();
+
+        items.exit()
+            .remove();
+    }
+
+    function CategoryItem(preset) {
+        var box, sublist, shown = false;
+
+        function item(selection) {
+            var wrap = selection.append('div')
+                .attr('class', 'preset-list-button-wrap category col12');
+
+            wrap.append('button')
+                .attr('class', 'preset-list-button')
+                .call(iD.ui.PresetIcon()
+                    .geometry(context.geometry(id))
+                    .preset(preset))
+                .on('click', item.choose)
+                .append('div')
+                .attr('class', 'label')
+                .text(preset.name());
+
+            box = selection.append('div')
+                .attr('class', 'subgrid col12')
+                .style('max-height', '0px')
+                .style('opacity', 0);
+
+            box.append('div')
+                .attr('class', 'arrow');
+
+            sublist = box.append('div')
+                .attr('class', 'preset-list fillL3 cf fl');
+        }
+
+        item.choose = function() {
+            if (!box || !sublist) return;
+
+            if (shown) {
+                shown = false;
+                box.transition()
+                    .duration(200)
+                    .style('opacity', '0')
+                    .style('max-height', '0px')
+                    .style('padding-bottom', '0px');
+            } else {
+                shown = true;
+                sublist.call(drawList, preset.members);
+                box.transition()
+                    .duration(200)
+                    .style('opacity', '1')
+                    .style('max-height', 200 + preset.members.collection.length * 80 + 'px')
+                    .style('padding-bottom', '20px');
+            }
+        };
+
+        item.preset = preset;
+
+        return item;
+    }
+
+    function PresetItem(preset) {
+        function item(selection) {
+            var wrap = selection.append('div')
+                .attr('class', 'preset-list-button-wrap col12');
+
+            wrap.append('button')
+                .attr('class', 'preset-list-button')
+                .call(iD.ui.PresetIcon()
+                    .geometry(context.geometry(id))
+                    .preset(preset))
+                .on('click', item.choose)
+                .append('div')
+                .attr('class', 'label')
+                .text(preset.name());
+
+            wrap.call(item.reference.button);
+            selection.call(item.reference.body);
+        }
+
+        item.choose = function() {
+            context.presets().choose(preset);
+
+            context.perform(
+                iD.actions.ChangePreset(id, currentPreset, preset),
+                t('operations.change_tags.annotation'));
+
+            event.choose(preset);
+        };
+
+        item.help = function() {
+            d3.event.stopPropagation();
+            item.reference.toggle();
+        };
+
+        item.preset = preset;
+        item.reference = iD.ui.TagReference(preset.reference(context.geometry(id)), context);
+
+        return item;
+    }
+
+    presetList.autofocus = function(_) {
+        if (!arguments.length) return autofocus;
+        autofocus = _;
+        return presetList;
+    };
+
+    presetList.entityID = function(_) {
+        if (!arguments.length) return id;
+        id = _;
+        presetList.preset(context.presets().match(context.entity(id), context.graph()));
+        return presetList;
+    };
+
+    presetList.preset = function(_) {
+        if (!arguments.length) return currentPreset;
+        currentPreset = _;
+        return presetList;
+    };
+
+    return d3.rebind(presetList, event, 'on');
 };
 iD.ui.SourceSwitch = function(context) {
     var keys;
@@ -39671,6 +39671,135 @@ iD.presets = function() {
 
     return all;
 };
+iD.presets.Preset = function(id, preset, fields) {
+    preset = _.clone(preset);
+
+    preset.id = id;
+    preset.fields = (preset.fields || []).map(getFields);
+    preset.geometry = (preset.geometry || []);
+
+    function getFields(f) {
+        return fields[f];
+    }
+
+    preset.matchGeometry = function(geometry) {
+        return preset.geometry.indexOf(geometry) >= 0;
+    };
+
+    var matchScore = preset.matchScore || 1;
+    preset.matchScore = function(entity) {
+        var tags = preset.tags,
+            score = 0;
+
+        for (var t in tags) {
+            if (entity.tags[t] === tags[t]) {
+                score += matchScore;
+            } else if (tags[t] === '*' && t in entity.tags) {
+                score += matchScore / 2;
+            } else {
+                return -1;
+            }
+        }
+
+        return score;
+    };
+
+    preset.t = function(scope, options) {
+        return t('presets.presets.' + id + '.' + scope, options);
+    };
+
+    var name = preset.name;
+    preset.name = function() {
+        if (preset.suggestion) {
+            id = id.split('/');
+            id = id[0] + '/' + id[1];
+            return name + ' - ' + t('presets.presets.' + id + '.name');
+        }
+        return preset.t('name', {'default': name});
+    };
+
+    preset.terms = function() {
+        return preset.t('terms', {'default': ''}).toLowerCase().trim().split(/\s*,+\s*/);
+    };
+
+    preset.isFallback = function() {
+        var tagCount = Object.keys(preset.tags).length;
+        return tagCount === 0 || (tagCount === 1 && preset.tags.hasOwnProperty('area'));
+    };
+
+    preset.reference = function(geometry) {
+        var key = Object.keys(preset.tags)[0],
+            value = preset.tags[key];
+
+        if (geometry === 'relation' && key === 'type') {
+            return { rtype: value };
+        } else if (value === '*') {
+            return { key: key };
+        } else {
+            return { key: key, value: value };
+        }
+    };
+
+    var removeTags = preset.removeTags || preset.tags;
+    preset.removeTags = function(tags, geometry) {
+        tags = _.omit(tags, _.keys(removeTags));
+
+        for (var f in preset.fields) {
+            var field = preset.fields[f];
+            if (field.matchGeometry(geometry) && field.default === tags[field.key]) {
+                delete tags[field.key];
+            }
+        }
+
+        delete tags.area;
+        return tags;
+    };
+
+    var applyTags = preset.addTags || preset.tags;
+    preset.applyTags = function(tags, geometry) {
+        var k;
+
+        tags = _.clone(tags);
+
+        for (k in applyTags) {
+            if (applyTags[k] === '*') {
+                tags[k] = 'yes';
+            } else {
+                tags[k] = applyTags[k];
+            }
+        }
+
+        // Add area=yes if necessary.
+        // This is necessary if the geometry is already an area (e.g. user drew an area) AND any of:
+        // 1. chosen preset could be either an area or a line (`barrier=city_wall`)
+        // 2. chosen preset doesn't have a key in areaKeys (`railway=station`)
+        if (geometry === 'area') {
+            var needsAreaTag = true;
+            if (preset.geometry.indexOf('line') === -1) {
+                for (k in applyTags) {
+                    if (k in iD.areaKeys) {
+                        needsAreaTag = false;
+                        break;
+                    }
+                }
+            }
+            if (needsAreaTag) {
+                tags.area = 'yes';
+            }
+        }
+
+        for (var f in preset.fields) {
+            var field = preset.fields[f];
+            if (field.matchGeometry(geometry) && field.key && !tags[field.key] && field.default) {
+                tags[field.key] = field.default;
+            }
+        }
+
+        return tags;
+    };
+
+    return preset;
+};
 iD.presets.Category = function(id, category, all) {
     category = _.clone(category);
 
@@ -39695,6 +39824,30 @@ iD.presets.Category = function(id, category, all) {
     };
 
     return category;
+};
+iD.presets.Field = function(id, field) {
+    field = _.clone(field);
+
+    field.id = id;
+
+    field.matchGeometry = function(geometry) {
+        return !field.geometry || field.geometry === geometry;
+    };
+
+    field.t = function(scope, options) {
+        return t('presets.fields.' + id + '.' + scope, options);
+    };
+
+    field.label = function() {
+        return field.t('label', {'default': id});
+    };
+
+    var placeholder = field.placeholder;
+    field.placeholder = function() {
+        return field.t('placeholder', {'default': placeholder});
+    };
+
+    return field;
 };
 iD.presets.Collection = function(collection) {
 
@@ -39824,159 +39977,6 @@ iD.presets.Collection = function(collection) {
     };
 
     return presets;
-};
-iD.presets.Field = function(id, field) {
-    field = _.clone(field);
-
-    field.id = id;
-
-    field.matchGeometry = function(geometry) {
-        return !field.geometry || field.geometry === geometry;
-    };
-
-    field.t = function(scope, options) {
-        return t('presets.fields.' + id + '.' + scope, options);
-    };
-
-    field.label = function() {
-        return field.t('label', {'default': id});
-    };
-
-    var placeholder = field.placeholder;
-    field.placeholder = function() {
-        return field.t('placeholder', {'default': placeholder});
-    };
-
-    return field;
-};
-iD.presets.Preset = function(id, preset, fields) {
-    preset = _.clone(preset);
-
-    preset.id = id;
-    preset.fields = (preset.fields || []).map(getFields);
-    preset.geometry = (preset.geometry || []);
-
-    function getFields(f) {
-        return fields[f];
-    }
-
-    preset.matchGeometry = function(geometry) {
-        return preset.geometry.indexOf(geometry) >= 0;
-    };
-
-    var matchScore = preset.matchScore || 1;
-    preset.matchScore = function(entity) {
-        var tags = preset.tags,
-            score = 0;
-
-        for (var t in tags) {
-            if (entity.tags[t] === tags[t]) {
-                score += matchScore;
-            } else if (tags[t] === '*' && t in entity.tags) {
-                score += matchScore / 2;
-            } else {
-                return -1;
-            }
-        }
-
-        return score;
-    };
-
-    preset.t = function(scope, options) {
-        return t('presets.presets.' + id + '.' + scope, options);
-    };
-
-    var name = preset.name;
-    preset.name = function() {
-        if (preset.suggestion) {
-            id = id.split('/');
-            id = id[0] + '/' + id[1];
-            return name + ' - ' + t('presets.presets.' + id + '.name');
-        }
-        return preset.t('name', {'default': name});
-    };
-
-    preset.terms = function() {
-        return preset.t('terms', {'default': ''}).toLowerCase().trim().split(/\s*,+\s*/);
-    };
-
-    preset.isFallback = function() {
-        var tagCount = Object.keys(preset.tags).length;
-        return tagCount === 0 || (tagCount === 1 && preset.tags.hasOwnProperty('area'));
-    };
-
-    preset.reference = function(geometry) {
-        var key = Object.keys(preset.tags)[0],
-            value = preset.tags[key];
-
-        if (geometry === 'relation' && key === 'type') {
-            return { rtype: value };
-        } else if (value === '*') {
-            return { key: key };
-        } else {
-            return { key: key, value: value };
-        }
-    };
-
-    var removeTags = preset.removeTags || preset.tags;
-    preset.removeTags = function(tags, geometry) {
-        tags = _.omit(tags, _.keys(removeTags));
-
-        for (var f in preset.fields) {
-            var field = preset.fields[f];
-            if (field.matchGeometry(geometry) && field.default === tags[field.key]) {
-                delete tags[field.key];
-            }
-        }
-
-        delete tags.area;
-        return tags;
-    };
-
-    var applyTags = preset.addTags || preset.tags;
-    preset.applyTags = function(tags, geometry) {
-        var k;
-
-        tags = _.clone(tags);
-
-        for (k in applyTags) {
-            if (applyTags[k] === '*') {
-                tags[k] = 'yes';
-            } else {
-                tags[k] = applyTags[k];
-            }
-        }
-
-        // Add area=yes if necessary.
-        // This is necessary if the geometry is already an area (e.g. user drew an area) AND any of:
-        // 1. chosen preset could be either an area or a line (`barrier=city_wall`)
-        // 2. chosen preset doesn't have a key in areaKeys (`railway=station`)
-        if (geometry === 'area') {
-            var needsAreaTag = true;
-            if (preset.geometry.indexOf('line') === -1) {
-                for (k in applyTags) {
-                    if (k in iD.areaKeys) {
-                        needsAreaTag = false;
-                        break;
-                    }
-                }
-            }
-            if (needsAreaTag) {
-                tags.area = 'yes';
-            }
-        }
-
-        for (var f in preset.fields) {
-            var field = preset.fields[f];
-            if (field.matchGeometry(geometry) && field.key && !tags[field.key] && field.default) {
-                tags[field.key] = field.default;
-            }
-        }
-
-        return tags;
-    };
-
-    return preset;
 };
 iD.validations = {};
 iD.validations.MissingTag = function() {
